@@ -1,0 +1,7 @@
+build_out/
+*.idsig
+*.keystore
+*.jks
+.DS_Store
+Thumbs.db
+*.log
