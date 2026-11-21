@@ -25,30 +25,22 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
-
-import de.robv.android.xposed.IXposedHookLoadPackage;
-import de.robv.android.xposed.XC_MethodHook;
-import de.robv.android.xposed.XposedBridge;
-import de.robv.android.xposed.XposedHelpers;
-import de.robv.android.xposed.callbacks.XC_LoadPackage;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * LSPosed Module for Notify for Amazfit (com.mc.amazfit1) v24.0.1
- * Target Device: Amazfit Balance 2 (Zepp OS 3.5+)
+ * Dual-API Xposed/LSPosed Module (libxposed API 101/102 + legacy Xposed API 82)
+ * for Notify for Amazfit (com.mc.amazfit1) v24.1.1 / v24.0.3
+ * Target Device: Amazfit Balance 2 (Zepp OS 6 / 3.5+)
  *
- * Fixes:
- * 1. Obfuscation compatibility for both Notify 24.0.1 builds:
- *    - Latest build (Notify_phone_latest.apk): Lnf8, Lof8, Lpf8, Luo0, Llf8, Lre8, Lev5, La96, Lz38, Lz86, Lnl5, Ldy, Le48
- *    - Older build (Notify_phone.apk): Lkf8, Llf8, Lmf8, Luo0, Lif8, Loe8, Lcv5, Ly86, Lmh7, Lll5, Lse8, Lb48
- * 2. Real location overwrite (Breezy Weather / Gadgetbridge / ECMWF) over Zepp / GNSS city on watch.
- * 3. Strict Single-City enforcement (purges all extra cities in 0x05 and 0x09 so only 1 city exists on watch).
- * 4. Feels-like temperature (temperatureApparent) 0°C bug fix & 24-hour forecast real hourly variations.
- * 5. Automatic AGPS update triggered alongside weather sync via Notify's internal dispatcher (Le48/Lb48).
+ * NOTE: This class intentionally has ZERO references to {@code de.robv.android.xposed.*}
+ * or {@code io.github.libxposed.*}; all hooking, logging and preferences go through
+ * {@link HookBridge}, wired by {@link ModernXposedEntry} or {@link LegacyXposedEntry}.
  */
-public class NotifyWeatherHook implements IXposedHookLoadPackage {
+public class NotifyWeatherHook {
 
     private static final String TAG = "Balance2WeatherFix";
-    private static final String TARGET_PACKAGE = "com.mc.amazfit1";
+    static final String TARGET_PACKAGE = "com.mc.amazfit1";
+    private static final AtomicBoolean sHooksInitialized = new AtomicBoolean(false);
     private static final String ACTION_TRIGGER_SYNC = "com.amazfit.balance2fix.TRIGGER_SYNC";
     private static final String ACTION_DUMP_GATT = "com.amazfit.balance2fix.DUMP_GATT";
     private static final String ACTION_GATT_RESULT = "com.amazfit.balance2fix.GATT_RESULT";
@@ -86,6 +78,14 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
     private static final String PREF_AGPS_EXPIRE_MS = "balance2_agps_expire_ms";
     private static final String NOTIFY_AGPS_TIME_KEY = "22d907dc-6606-4aac-ba8d-d6219402818e";
 
+    // Notify v24.1.1 internal broadcast action UUIDs
+    private static final String ACTION_NOTIFY_DO_AGPS_UUID = "fc53784d-e0be-463a-924d-bd6c1d8a11a3";
+    private static final String ACTION_NOTIFY_FW_PROGRESS_UUID = "2bc128ac-7a29-4a68-aad1-f9684058b77f";
+    private static final String ACTION_NOTIFY_FW_DONE_UUID = "d288b5ef-4b71-4432-9c49-ec641bf0c788";
+    private static final String ACTION_NOTIFY_FW_KO_UUID = "2c1cdc19-8e2f-46c2-9d53-05832e1c0240";
+    private static final String ACTION_NOTIFY_WEATHER_UPDATED_UUID = "1a49176a-7315-4ddb-8e0a-20c4faa6ebb9";
+    private static final String ACTION_NOTIFY_WEATHER_FAILED_UUID = "d6ff1901-69d0-471d-ab45-d710f44ed1ae";
+
     // Cached real city & coordinates from external provider (Breezy Weather / Gadgetbridge) or prefs
     private static volatile String sRealCityName = null;
     private static volatile Double sRealLatitude = null;
@@ -101,11 +101,15 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
     private static volatile Class<?> sSettingsClass = null;
     private static volatile Class<?> sCityClass = null;
     private static volatile Class<?> sProtocolClass = null;
-    private static volatile String sWriteSettingsMethodName = "B";
-    private static volatile String sFallbackWriteMethodName = "C";
-    private static volatile String sVerifyDefaultMethodName = "D";
-    private static volatile String sSendRawBleMethodName = "G";
-    private static volatile String sLatchUpdateMethodName = "F";
+    private static volatile String sQueryProtocolMethodName = "u";
+    private static volatile String sQuerySettingsMethodName = "x";
+    private static volatile String sQueryCitiesMethodName = "w";
+    private static volatile String sWriteSettingsMethodName = "A";
+    private static volatile String sFallbackWriteMethodName = "B";
+    private static volatile String sVerifyDefaultMethodName = "C";
+    private static volatile String sCheckGnssUnavailMethodName = "D";
+    private static volatile String sLatchUpdateMethodName = "E";
+    private static volatile String sSendRawBleMethodName = "F";
 
     // Cached hourly forecast list (A in Lre8/Loe8) to prevent Notify from clearing it
     private static volatile ArrayList<?> sCachedHourlyForecastList = null;
@@ -125,22 +129,17 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
     private static final String KEY_GNSS_LOCATION_KEY = "ee7ca29f-0509-4d04-b50d-54c09456e830";
 
     private static void logInfo(String msg) {
-        XposedBridge.log("[" + TAG + "] " + msg);
-        Log.i(TAG, msg);
+        HookBridge.logInfo(TAG, msg);
     }
 
     private static void logError(String msg, Throwable t) {
-        XposedBridge.log("[" + TAG + "] ERROR: " + msg);
-        if (t != null) {
-            XposedBridge.log(t);
-        }
-        Log.e(TAG, msg, t);
+        HookBridge.logError(TAG, msg, t);
     }
 
     private static Class<?> findClassSafe(ClassLoader cl, String... names) {
         for (String name : names) {
             if (name == null || name.isEmpty()) continue;
-            Class<?> c = XposedHelpers.findClassIfExists(name, cl);
+            Class<?> c = HookBridge.findClassIfExists(name, cl);
             if (c != null) return c;
         }
         return null;
@@ -156,14 +155,99 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
         }
     }
 
-    @Override
-    public void handleLoadPackage(final XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
-        if (!TARGET_PACKAGE.equals(lpparam.packageName)) {
+    private static boolean hasMethodWithReturn(Class<?> clazz, String name, Class<?> returnType, Class<?>... paramTypes) {
+        if (clazz == null) return false;
+        try {
+            Method m = clazz.getDeclaredMethod(name, paramTypes);
+            return returnType == null || returnType.isAssignableFrom(m.getReturnType());
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static Class<?> resolveWeatherDataClass(ClassLoader cl) {
+        Class<?> userPrefsClass = findClassSafe(cl, "com.mc.miband1.model.UserPreferences");
+        if (userPrefsClass != null) {
+            for (String mName : new String[]{"D7", "w7"}) {
+                try {
+                    Method m = userPrefsClass.getDeclaredMethod(mName);
+                    Class<?> ret = m.getReturnType();
+                    if (!ret.isPrimitive() && ret != String.class) {
+                        return ret;
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+        return findClassSafe(cl, "oe8", "re8");
+    }
+
+    private static Object callUserPrefsWeatherData(Object prefs, ClassLoader cl) {
+        if (prefs == null) return null;
+        Class<?> c = prefs.getClass();
+        for (String mName : new String[]{"D7", "w7"}) {
+            try {
+                Method m = c.getDeclaredMethod(mName);
+                if (!m.getReturnType().isPrimitive() && m.getReturnType() != String.class) {
+                    m.setAccessible(true);
+                    return m.invoke(prefs);
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        return null;
+    }
+
+    private static String callUserPrefsCity(Object prefs) {
+        if (prefs == null) return null;
+        Class<?> c = prefs.getClass();
+        // v24.1.1: H7() returns weather city; v24.0.3: A7()
+        boolean isV2411 = hasMethodWithReturn(c, "G7", double.class) && hasMethodWithReturn(c, "I7", double.class);
+        String[] candidates = isV2411 ? new String[]{"H7", "A7"} : new String[]{"A7", "H7"};
+        for (String mName : candidates) {
+            if (hasMethodWithReturn(c, mName, String.class)) {
+                try {
+                    return (String) HookBridge.callMethod(prefs, mName);
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+        return null;
+    }
+
+    private static double[] callUserPrefsLatLon(Object prefs) {
+        if (prefs == null) return null;
+        Class<?> c = prefs.getClass();
+        // v24.1.1: G7() / I7(); v24.0.3: o6() / p6()
+        String[][] pairs = new String[][]{{"G7", "I7"}, {"o6", "p6"}};
+        for (String[] pair : pairs) {
+            if (hasMethodWithReturn(c, pair[0], double.class) && hasMethodWithReturn(c, pair[1], double.class)) {
+                try {
+                    double lat = (Double) HookBridge.callMethod(prefs, pair[0]);
+                    double lon = (Double) HookBridge.callMethod(prefs, pair[1]);
+                    if (Math.abs(lat) > 0.001 || Math.abs(lon) > 0.001) {
+                        return new double[]{lat, lon};
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+        return null;
+    }
+
+    public static void initForPackage(String packageName, ClassLoader cl) {
+        if (!TARGET_PACKAGE.equals(packageName) || cl == null) {
             return;
         }
+        if (!sHooksInitialized.compareAndSet(false, true)) {
+            return;
+        }
+        new NotifyWeatherHook().installHooks(packageName, cl);
+    }
 
-        final ClassLoader cl = lpparam.classLoader;
-        logInfo("Initializing NotifyBalance2Fix (v4.0 - 3-Switch UI + ZeppOS 6 AGPS Fix + HyperOS Unlock) for " + lpparam.packageName);
+    private void installHooks(String packageName, final ClassLoader cl) {
+        logInfo("Initializing NotifyBalance2Fix (v4.2 [" + HookBridge.getApiDescription()
+                + "] - Notify v24.1.1/v24.0.3 Weather + ZeppOS 6 AGPS + HyperOS Unlock + VoIP) for " + packageName);
 
         loadModuleConfigFromPrefs(null, cl);
 
@@ -180,7 +264,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
         hookBandSettingsUnlockUI(cl);
         hookVoipCallPipeline(cl);
 
-        logInfo("All hooks installed for " + lpparam.packageName);
+        logInfo("All hooks installed for " + packageName);
     }
 
     // =========================================================================
@@ -228,14 +312,10 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                 long savedExp = sp.getLong(PREF_AGPS_EXPIRE_MS, 0L);
                 if (savedExp > sAgpsExpireMs) sAgpsExpireMs = savedExp;
             }
-            // 2. Also check XSharedPreferences from com.amazfit.balance2fix via reflection
+            // 2. Also check module preferences via HookBridge (libxposed RemotePreferences or legacy XSharedPreferences)
             try {
-                Class<?> xspClass = Class.forName("de.robv.android.xposed.XSharedPreferences");
-                Object xspObj = xspClass.getConstructor(String.class, String.class)
-                        .newInstance("com.amazfit.balance2fix", MainActivity.PREFS_NAME);
-                xspClass.getMethod("reload").invoke(xspObj);
-                if (xspObj instanceof SharedPreferences) {
-                    SharedPreferences xsp = (SharedPreferences) xspObj;
+                SharedPreferences xsp = HookBridge.getModulePreferences(MainActivity.PREFS_NAME);
+                if (xsp != null) {
                     if (xsp.contains(MainActivity.KEY_WEATHER_FIX)) {
                         sEnableWeatherFix = xsp.getBoolean(MainActivity.KEY_WEATHER_FIX, sEnableWeatherFix);
                     }
@@ -251,13 +331,13 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                 }
             } catch (Throwable ignored) {
             }
-            // 3. Also check Notify's Lux7 AGPS timestamp ("22d907dc-6606-4aac-ba8d-d6219402818e")
+            // 3. Also check Notify's Lyx7/Lux7 AGPS timestamp ("22d907dc-6606-4aac-ba8d-d6219402818e")
             Context appCtx = ctx != null ? ctx.getApplicationContext() : sAppContext;
             if (appCtx != null && cl != null) {
                 try {
-                    Class<?> ux7Class = findClassSafe(cl, "ux7");
+                    Class<?> ux7Class = findClassSafe(cl, "yx7", "ux7");
                     if (ux7Class != null && hasMethod(ux7Class, "e", Context.class, String.class)) {
-                        long notifyAgpsTime = (Long) XposedHelpers.callStaticMethod(ux7Class, "e", appCtx, NOTIFY_AGPS_TIME_KEY);
+                        long notifyAgpsTime = (Long) HookBridge.callStaticMethod(ux7Class, "e", appCtx, NOTIFY_AGPS_TIME_KEY);
                         if (notifyAgpsTime > sAgpsLastUpdateMs) {
                             sAgpsLastUpdateMs = notifyAgpsTime;
                             if (sAgpsExpireMs <= 0L) {
@@ -298,6 +378,14 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
             report.setPackage("com.amazfit.balance2fix");
             report.addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES);
             report.putExtra("hook_active", true);
+            report.putExtra("xposed_api", HookBridge.getApiDescription());
+            try {
+                String verName = ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0).versionName;
+                if (verName != null) {
+                    report.putExtra("notify_version", verName);
+                }
+            } catch (Throwable ignored) {
+            }
             report.putExtra(MainActivity.KEY_AGPS_LAST_UPDATE, sAgpsLastUpdateMs);
             report.putExtra(MainActivity.KEY_AGPS_EXPIRE, sAgpsExpireMs);
             if (progressMsg != null) {
@@ -312,7 +400,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
         try {
             Class<?> appClass = findClassSafe(cl, "com.mc.miband1.App", "android.app.Application");
             if (appClass != null) {
-                XposedHelpers.findAndHookMethod(appClass, "onCreate", new XC_MethodHook() {
+                HookBridge.findAndHookMethod(appClass, "onCreate", new HookBridge.MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
                         if (param.thisObject instanceof Context) {
@@ -451,17 +539,21 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                             dumpWatchGattAndMiBleStatus(ctx, cl, false);
                             loadRealLocationFromPrefs(cl);
                             if (isWeatherFixEnabled(cl)) {
-                                // Trigger Weather Sync via Llf8 (latest) or Lif8 (older)
-                                Class<?> syncClass = findClassSafe(cl, "lf8", "if8");
+                                // Trigger Weather Sync via Lif8.l(ctx, true) [v24.1.1] or Llf8/Lif8.k(ctx, true) [v24.0.3]
+                                Class<?> syncClass = findClassSafe(cl, "if8", "lf8");
                                 if (syncClass != null) {
-                                    for (Field f : syncClass.getDeclaredFields()) {
-                                        if (f.getType() == syncClass) {
-                                            f.setAccessible(true);
-                                            Object singleton = f.get(null);
-                                            if (singleton != null) {
-                                                logInfo("Triggering WeatherSync singleton (" + syncClass.getName() + ").k(ctx, true)...");
-                                                XposedHelpers.callMethod(singleton, "k", ctx, true);
-                                                break;
+                                    String triggerMethod = hasMethod(syncClass, "l", Context.class, boolean.class) ? "l"
+                                            : (hasMethod(syncClass, "k", Context.class, boolean.class) ? "k" : null);
+                                    if (triggerMethod != null) {
+                                        for (Field f : syncClass.getDeclaredFields()) {
+                                            if (f.getType() == syncClass) {
+                                                f.setAccessible(true);
+                                                Object singleton = f.get(null);
+                                                if (singleton != null) {
+                                                    logInfo("Triggering WeatherSync singleton (" + syncClass.getName() + ")." + triggerMethod + "(ctx, true)...");
+                                                    HookBridge.callMethod(singleton, triggerMethod, ctx, true);
+                                                    break;
+                                                }
                                             }
                                         }
                                     }
@@ -505,7 +597,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                     "com.mc.miband1.weather.GenericWeatherReceiver");
             if (receiverClass != null) {
                 if (hasMethod(receiverClass, "h", JSONObject.class)) {
-                    XposedHelpers.findAndHookMethod(receiverClass, "h", JSONObject.class, new XC_MethodHook() {
+                    HookBridge.findAndHookMethod(receiverClass, "h", JSONObject.class, new HookBridge.MethodHook() {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
                             if (!isWeatherFixEnabled(cl)) return;
@@ -537,7 +629,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                     });
                 }
 
-                XposedHelpers.findAndHookMethod(receiverClass, "onReceive", Context.class, Intent.class, new XC_MethodHook() {
+                HookBridge.findAndHookMethod(receiverClass, "onReceive", Context.class, Intent.class, new HookBridge.MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         Context ctx = (Context) param.args[0];
@@ -590,20 +682,25 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                 logInfo("Hooked GenericWeatherReceiver (" + receiverClass.getName() + ").onReceive & .h");
             }
 
-            // Hook UserPreferences.Du(Lre8/Loe8) and w7() to dynamically extract new weather location & preserve hourly forecasts (field A)
+            // Hook UserPreferences.Vu/Du(Loe8/Lre8) and D7/w7() to dynamically extract new weather location & preserve hourly forecasts (field A)
             Class<?> userPrefsClass = findClassSafe(cl, "com.mc.miband1.model.UserPreferences");
-            Class<?> weatherDataClass = findClassSafe(cl, "re8", "oe8");
+            Class<?> weatherDataClass = resolveWeatherDataClass(cl);
             if (userPrefsClass != null && weatherDataClass != null) {
-                if (hasMethod(userPrefsClass, "Du", weatherDataClass)) {
-                    XposedHelpers.findAndHookMethod(userPrefsClass, "Du", weatherDataClass, new XC_MethodHook() {
+                String setWeatherMethod = hasMethod(userPrefsClass, "Vu", weatherDataClass) ? "Vu"
+                        : (hasMethod(userPrefsClass, "Du", weatherDataClass) ? "Du" : null);
+                String getWeatherMethod = hasMethodWithReturn(userPrefsClass, "D7", weatherDataClass) ? "D7"
+                        : (hasMethodWithReturn(userPrefsClass, "w7", weatherDataClass) ? "w7" : null);
+
+                if (setWeatherMethod != null) {
+                    HookBridge.findAndHookMethod(userPrefsClass, setWeatherMethod, weatherDataClass, new HookBridge.MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
                             Object weatherData = param.args[0];
                             if (weatherData == null) return;
                             try {
-                                String inCity = (String) XposedHelpers.getObjectField(weatherData, "i");
-                                double inLat = XposedHelpers.getDoubleField(weatherData, "q");
-                                double inLon = XposedHelpers.getDoubleField(weatherData, "w");
+                                String inCity = (String) HookBridge.getObjectField(weatherData, "i");
+                                double inLat = HookBridge.getDoubleField(weatherData, "q");
+                                double inLon = HookBridge.getDoubleField(weatherData, "w");
                                 if (inCity != null && !inCity.trim().isEmpty()
                                         && !"Hengke Village".equalsIgnoreCase(inCity.trim())) {
                                     sRealCityName = inCity.trim();
@@ -612,44 +709,44 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                                         sRealLongitude = inLon;
                                     }
                                     saveRealLocationToPrefs(sAppContext, cl, sRealCityName, sRealLatitude, sRealLongitude);
-                                    logInfo("[UserPreferences.Du] Extracted fresh weather location: city='" + sRealCityName
+                                    logInfo("[UserPreferences." + setWeatherMethod + "] Extracted fresh weather location: city='" + sRealCityName
                                             + "', lat=" + sRealLatitude + ", lon=" + sRealLongitude);
                                 } else {
                                     String realCity = getRealCityName(cl);
                                     if (realCity != null && !realCity.isEmpty()) {
-                                        XposedHelpers.setObjectField(weatherData, "i", realCity);
+                                        HookBridge.setObjectField(weatherData, "i", realCity);
                                     }
                                     if (sRealLatitude != null && sRealLongitude != null) {
-                                        XposedHelpers.setDoubleField(weatherData, "q", sRealLatitude);
-                                        XposedHelpers.setDoubleField(weatherData, "w", sRealLongitude);
+                                        HookBridge.setDoubleField(weatherData, "q", sRealLatitude);
+                                        HookBridge.setDoubleField(weatherData, "w", sRealLongitude);
                                     }
                                 }
-                                ArrayList<?> hourlyList = (ArrayList<?>) XposedHelpers.getObjectField(weatherData, "A");
+                                ArrayList<?> hourlyList = (ArrayList<?>) HookBridge.getObjectField(weatherData, "A");
                                 if (hourlyList != null && !hourlyList.isEmpty()) {
                                     sCachedHourlyForecastList = new ArrayList<>(hourlyList);
-                                    logInfo("[UserPreferences.Du] Cached " + sCachedHourlyForecastList.size() + " hourly forecast entries");
+                                    logInfo("[UserPreferences." + setWeatherMethod + "] Cached " + sCachedHourlyForecastList.size() + " hourly forecast entries");
                                 } else if (sCachedHourlyForecastList != null && !sCachedHourlyForecastList.isEmpty()) {
-                                    XposedHelpers.setObjectField(weatherData, "A", new ArrayList<>(sCachedHourlyForecastList));
-                                    logInfo("[UserPreferences.Du] Restored " + sCachedHourlyForecastList.size() + " hourly forecast entries into empty A");
+                                    HookBridge.setObjectField(weatherData, "A", new ArrayList<>(sCachedHourlyForecastList));
+                                    logInfo("[UserPreferences." + setWeatherMethod + "] Restored " + sCachedHourlyForecastList.size() + " hourly forecast entries into empty A");
                                 }
                                 sanitizeWeatherDataFeelsLike(weatherData);
                             } catch (Throwable t) {
-                                logError("Error in UserPreferences.Du hook", t);
+                                logError("Error in UserPreferences." + setWeatherMethod + " hook", t);
                             }
                         }
                     });
                 }
 
-                if (hasMethod(userPrefsClass, "w7")) {
-                    XposedHelpers.findAndHookMethod(userPrefsClass, "w7", new XC_MethodHook() {
+                if (getWeatherMethod != null) {
+                    HookBridge.findAndHookMethod(userPrefsClass, getWeatherMethod, new HookBridge.MethodHook() {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
                             Object weatherData = param.getResult();
                             if (weatherData == null) return;
                             try {
-                                String inCity = (String) XposedHelpers.getObjectField(weatherData, "i");
-                                double inLat = XposedHelpers.getDoubleField(weatherData, "q");
-                                double inLon = XposedHelpers.getDoubleField(weatherData, "w");
+                                String inCity = (String) HookBridge.getObjectField(weatherData, "i");
+                                double inLat = HookBridge.getDoubleField(weatherData, "q");
+                                double inLon = HookBridge.getDoubleField(weatherData, "w");
                                 if (inCity != null && !inCity.trim().isEmpty()
                                         && !"Hengke Village".equalsIgnoreCase(inCity.trim())) {
                                     sRealCityName = inCity.trim();
@@ -660,16 +757,16 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                                 } else {
                                     String realCity = getRealCityName(cl);
                                     if (realCity != null && !realCity.isEmpty()) {
-                                        XposedHelpers.setObjectField(weatherData, "i", realCity);
+                                        HookBridge.setObjectField(weatherData, "i", realCity);
                                     }
                                     if (sRealLatitude != null && sRealLongitude != null) {
-                                        XposedHelpers.setDoubleField(weatherData, "q", sRealLatitude);
-                                        XposedHelpers.setDoubleField(weatherData, "w", sRealLongitude);
+                                        HookBridge.setDoubleField(weatherData, "q", sRealLatitude);
+                                        HookBridge.setDoubleField(weatherData, "w", sRealLongitude);
                                     }
                                 }
-                                ArrayList<?> hourlyList = (ArrayList<?>) XposedHelpers.getObjectField(weatherData, "A");
+                                ArrayList<?> hourlyList = (ArrayList<?>) HookBridge.getObjectField(weatherData, "A");
                                 if ((hourlyList == null || hourlyList.isEmpty()) && sCachedHourlyForecastList != null && !sCachedHourlyForecastList.isEmpty()) {
-                                    XposedHelpers.setObjectField(weatherData, "A", new ArrayList<>(sCachedHourlyForecastList));
+                                    HookBridge.setObjectField(weatherData, "A", new ArrayList<>(sCachedHourlyForecastList));
                                 }
                                 sanitizeWeatherDataFeelsLike(weatherData);
                             } catch (Throwable ignored) {
@@ -677,23 +774,28 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                         }
                     });
                 }
-                logInfo("Hooked UserPreferences.Du & w7 for weatherDataClass=" + weatherDataClass.getName());
+                logInfo("Hooked UserPreferences." + setWeatherMethod + " & " + getWeatherMethod + " for weatherDataClass=" + weatherDataClass.getName());
             }
 
-            // Hook WeatherSync singleton (Llf8 in latest APK, Lif8 in older APK)
-            for (String syncClassName : new String[]{"lf8", "if8"}) {
+            // Hook WeatherSync singleton (Lif8.j/l in v24.1.1, Llf8/Lif8.i/k in v24.0.3)
+            for (String syncClassName : new String[]{"if8", "lf8"}) {
                 Class<?> syncCand = findClassSafe(cl, syncClassName);
-                if (syncCand != null && hasMethod(syncCand, "k", Context.class, boolean.class)) {
-                    // Prevent Lnf8.o from triggering a re-entrant Llf8.j(ctx) -> Llf8.k(ctx, false) sync mid-BLE-HTTP-transfer!
-                    if (userPrefsClass != null && hasMethod(syncCand, "i", userPrefsClass)) {
-                        XposedHelpers.findAndHookMethod(syncCand, "i", userPrefsClass, new XC_MethodHook() {
+                String syncTriggerMethod = hasMethod(syncCand, "l", Context.class, boolean.class) ? "l"
+                        : (hasMethod(syncCand, "k", Context.class, boolean.class) ? "k" : null);
+                if (syncCand != null && syncTriggerMethod != null) {
+                    // Prevent Endpoint 14 .o() from triggering a re-entrant weather sync mid-BLE-HTTP-transfer!
+                    String needSyncMethod = (userPrefsClass != null && hasMethodWithReturn(syncCand, "j", boolean.class, userPrefsClass)) ? "j"
+                            : ((userPrefsClass != null && hasMethodWithReturn(syncCand, "i", boolean.class, userPrefsClass)) ? "i" : null);
+                    if (needSyncMethod != null) {
+                        HookBridge.findAndHookMethod(syncCand, needSyncMethod, userPrefsClass, new HookBridge.MethodHook() {
                             @Override
                             protected void beforeHookedMethod(MethodHookParam param) {
                                 param.setResult(false);
                             }
                         });
                     }
-                    XposedHelpers.findAndHookMethod(syncCand, "k", Context.class, boolean.class, new XC_MethodHook() {
+                    final String mSync = syncTriggerMethod;
+                    HookBridge.findAndHookMethod(syncCand, syncTriggerMethod, Context.class, boolean.class, new HookBridge.MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
                             Context ctx = (Context) param.args[0];
@@ -702,14 +804,14 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                                 registerDebugReceiverIfNeeded(sAppContext, cl);
                             }
                             loadRealLocationFromPrefs(cl);
-                            logInfo("[WeatherSync.k] Starting weather sync (force=" + param.args[1] + "), realCity=" + sRealCityName
+                            logInfo("[WeatherSync." + mSync + "] Starting weather sync (force=" + param.args[1] + "), realCity=" + sRealCityName
                                     + ", lat=" + sRealLatitude + ", lon=" + sRealLongitude);
                             if (ctx != null) {
                                 triggerAgpsUpdate(ctx, cl, false);
                             }
                         }
                     });
-                    logInfo("Hooked WeatherSync class: " + syncCand.getName() + ".k(Context, boolean) & .i(UserPreferences)");
+                    logInfo("Hooked WeatherSync class: " + syncCand.getName() + "." + syncTriggerMethod + "(Context, boolean) & ." + needSyncMethod + "(UserPreferences)");
                     break;
                 }
             }
@@ -722,11 +824,11 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
     private static void sanitizeWeatherDataFeelsLike(Object weatherData) {
         if (weatherData == null) return;
         try {
-            Object currentCond = XposedHelpers.getObjectField(weatherData, "y"); // Lu51
+            Object currentCond = HookBridge.getObjectField(weatherData, "y"); // Lu51
             if (currentCond != null) {
                 fixU51FeelsLike(currentCond);
             }
-            ArrayList dailyList = (ArrayList) XposedHelpers.getObjectField(weatherData, "z");
+            ArrayList dailyList = (ArrayList) HookBridge.getObjectField(weatherData, "z");
             if (dailyList != null) {
                 while (dailyList.size() > 7) {
                     dailyList.remove(dailyList.size() - 1);
@@ -735,7 +837,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                     fixU51FeelsLike(item);
                 }
             }
-            ArrayList hourlyList = (ArrayList) XposedHelpers.getObjectField(weatherData, "A"); // ArrayList<Lzo2>
+            ArrayList hourlyList = (ArrayList) HookBridge.getObjectField(weatherData, "A"); // ArrayList<Lzo2>
             if (hourlyList != null && !hourlyList.isEmpty()) {
                 Calendar nowCal = Calendar.getInstance();
                 nowCal.set(Calendar.MINUTE, 0);
@@ -746,7 +848,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                 ArrayList trimmedHourly = new ArrayList(24);
                 for (Object hItem : hourlyList) {
                     if (hItem == null) continue;
-                    int epochSec = XposedHelpers.getIntField(hItem, "f");
+                    int epochSec = HookBridge.getIntField(hItem, "f");
                     if (epochSec == 0 || epochSec >= currentHourSec) {
                         trimmedHourly.add(hItem);
                         if (trimmedHourly.size() >= 24) {
@@ -769,10 +871,10 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                 boolean allIdentical = true;
                 for (Object hItem : hourlyList) {
                     if (hItem == null) continue;
-                    float temp = XposedHelpers.getFloatField(hItem, "i");
-                    float feels = XposedHelpers.getFloatField(hItem, "E");
-                    float hum = XposedHelpers.getFloatField(hItem, "w");
-                    float wind = XposedHelpers.getFloatField(hItem, "x");
+                    float temp = HookBridge.getFloatField(hItem, "i");
+                    float feels = HookBridge.getFloatField(hItem, "E");
+                    float hum = HookBridge.getFloatField(hItem, "w");
+                    float wind = HookBridge.getFloatField(hItem, "x");
                     if (Float.isNaN(firstTemp)) {
                         firstTemp = temp;
                     } else if (Math.abs(temp - firstTemp) > 0.05f) {
@@ -784,27 +886,27 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                                 hum > 0 ? hum : 65.0,
                                 wind >= 0 ? wind : 5.0
                         );
-                        XposedHelpers.setFloatField(hItem, "E", (float) computed);
+                        HookBridge.setFloatField(hItem, "E", (float) computed);
                     }
                 }
                 if (allIdentical && hourlyList.size() > 1 && currentCond != null) {
-                    float minT = XposedHelpers.getFloatField(currentCond, "i");
-                    float maxT = XposedHelpers.getFloatField(currentCond, "q");
+                    float minT = HookBridge.getFloatField(currentCond, "i");
+                    float maxT = HookBridge.getFloatField(currentCond, "q");
                     if (maxT > minT + 0.5f) {
                         double meanT = (minT + maxT) / 2.0;
                         double amp = (maxT - minT) / 2.0;
                         for (Object hItem : hourlyList) {
                             if (hItem == null) continue;
-                            int epochSec = XposedHelpers.getIntField(hItem, "f");
+                            int epochSec = HookBridge.getIntField(hItem, "f");
                             Calendar cal = Calendar.getInstance();
                             if (epochSec > 0) cal.setTimeInMillis(epochSec * 1000L);
                             int hour = cal.get(Calendar.HOUR_OF_DAY);
                             double rad = ((hour - 14.0) / 24.0) * 2.0 * Math.PI;
                             float synthTemp = (float) (Math.round((meanT + amp * Math.cos(rad)) * 10.0) / 10.0);
-                            float hum = XposedHelpers.getFloatField(hItem, "w");
-                            float wind = XposedHelpers.getFloatField(hItem, "x");
-                            XposedHelpers.setFloatField(hItem, "i", synthTemp);
-                            XposedHelpers.setFloatField(hItem, "E", (float) computeApparentTemperature(
+                            float hum = HookBridge.getFloatField(hItem, "w");
+                            float wind = HookBridge.getFloatField(hItem, "x");
+                            HookBridge.setFloatField(hItem, "i", synthTemp);
+                            HookBridge.setFloatField(hItem, "E", (float) computeApparentTemperature(
                                     synthTemp,
                                     hum > 0 ? hum : 65.0,
                                     wind >= 0 ? wind : 5.0
@@ -820,20 +922,20 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
     private static void fixU51FeelsLike(Object u51) {
         if (u51 == null) return;
         try {
-            float curT = XposedHelpers.getFloatField(u51, "w");
-            float minT = XposedHelpers.getFloatField(u51, "i");
-            float maxT = XposedHelpers.getFloatField(u51, "q");
+            float curT = HookBridge.getFloatField(u51, "w");
+            float minT = HookBridge.getFloatField(u51, "i");
+            float maxT = HookBridge.getFloatField(u51, "q");
             double baseT = curT != 0 ? curT : ((minT != 0 && maxT != 0) ? (minT + maxT) / 2.0 : (maxT != 0 ? maxT : minT));
-            float feels = XposedHelpers.getFloatField(u51, "L");
-            float hum = XposedHelpers.getFloatField(u51, "B");
-            float wind = XposedHelpers.getFloatField(u51, "C");
+            float feels = HookBridge.getFloatField(u51, "L");
+            float hum = HookBridge.getFloatField(u51, "B");
+            float wind = HookBridge.getFloatField(u51, "C");
             if (Math.abs(feels) < 0.01f && Math.abs(baseT) > 3.0) {
                 double computed = computeApparentTemperature(
                         baseT,
                         hum > 0 ? hum : 65.0,
                         wind >= 0 ? wind : 5.0
                 );
-                XposedHelpers.setFloatField(u51, "L", (float) computed);
+                HookBridge.setFloatField(u51, "L", (float) computed);
             }
         } catch (Throwable ignored) {
         }
@@ -872,7 +974,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
             // CRITICAL: Force KEY_GNSS_ACTIVE_FLAG (6de38e8f-0c3c-445b-90fb-1a40d4b91572) to FALSE!
             // When this flag is true, Lnl5.a() overwrites our real coordinates & locationKey with the cached ",auto" GNSS key!
             if (hasMethod(prefsStoreClass, "b", String.class)) {
-                XposedHelpers.findAndHookMethod(prefsStoreClass, "b", String.class, new XC_MethodHook() {
+                HookBridge.findAndHookMethod(prefsStoreClass, "b", String.class, new HookBridge.MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         if (!isWeatherFixEnabled(cl)) return;
@@ -885,7 +987,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
             }
 
             if (hasMethod(prefsStoreClass, "m", String.class, boolean.class)) {
-                XposedHelpers.findAndHookMethod(prefsStoreClass, "m", String.class, boolean.class, new XC_MethodHook() {
+                HookBridge.findAndHookMethod(prefsStoreClass, "m", String.class, boolean.class, new HookBridge.MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         if (!isWeatherFixEnabled(cl)) return;
@@ -899,7 +1001,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
 
             // c() reads KEY_GNSS_LOCATION_KEY ("ee7ca29f-0509-4d04-b50d-54c09456e830")
             if (hasMethod(prefsStoreClass, "c")) {
-                XposedHelpers.findAndHookMethod(prefsStoreClass, "c", new XC_MethodHook() {
+                HookBridge.findAndHookMethod(prefsStoreClass, "c", new HookBridge.MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         if (!isWeatherFixEnabled(cl)) return;
@@ -910,7 +1012,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
 
             // g(String, String) reads string key from modelXHelper.a
             if (hasMethod(prefsStoreClass, "g", String.class, String.class)) {
-                XposedHelpers.findAndHookMethod(prefsStoreClass, "g", String.class, String.class, new XC_MethodHook() {
+                HookBridge.findAndHookMethod(prefsStoreClass, "g", String.class, String.class, new HookBridge.MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         if (!isWeatherFixEnabled(cl)) return;
@@ -929,7 +1031,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
 
             // l(String, String) writes string key to modelXHelper.a
             if (hasMethod(prefsStoreClass, "l", String.class, String.class)) {
-                XposedHelpers.findAndHookMethod(prefsStoreClass, "l", String.class, String.class, new XC_MethodHook() {
+                HookBridge.findAndHookMethod(prefsStoreClass, "l", String.class, String.class, new HookBridge.MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         if (!isWeatherFixEnabled(cl)) return;
@@ -953,57 +1055,61 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
     }
 
     // =========================================================================
-    // 3. Hook Place Model Builder (Lnl5 in latest APK, Lll5 / Lkl5 in older APK)
+    // 3. Hook Place Model Builder (Lll5 in v24.1.1, Lnl5 / Lll5 / Lkl5 in older APKs)
     // =========================================================================
     private void hookKl5PlaceModel(final ClassLoader cl) {
         try {
             Class<?> userPrefsClass = findClassSafe(cl, "com.mc.miband1.model.UserPreferences");
-            Class<?> placeClass = findClassSafe(cl, "nl5", "ll5", "kl5");
+            Class<?> placeClass = findClassSafe(cl, "ll5", "nl5", "kl5");
             if (placeClass == null || userPrefsClass == null) {
-                logError("Could not find Lnl5/Lll5 place model class", null);
+                logError("Could not find Lll5/Lnl5 place model class", null);
                 return;
             }
-            if (hasMethod(placeClass, "a", userPrefsClass)) {
-                XposedHelpers.findAndHookMethod(placeClass, "a", userPrefsClass, new XC_MethodHook() {
-                    @Override
-                    protected void afterHookedMethod(MethodHookParam param) {
-                        if (!isWeatherFixEnabled(cl)) return;
-                        Object placeObj = param.getResult();
-                        if (placeObj == null) return;
-                        try {
-                            String realCity = getRealCityName(cl);
-                            double[] coords = getRealCoordinates(cl, param.args[0]);
-                            String activeKey = (sActiveWatchLocationKey != null && !sActiveWatchLocationKey.isEmpty())
-                                    ? sActiveWatchLocationKey : "notify";
+            HookBridge.MethodHook placeHook = new HookBridge.MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    if (!isWeatherFixEnabled(cl)) return;
+                    Object placeObj = param.getResult();
+                    if (placeObj == null) return;
+                    try {
+                        String realCity = getRealCityName(cl);
+                        double[] coords = getRealCoordinates(cl, param.args[0]);
+                        String activeKey = (sActiveWatchLocationKey != null && !sActiveWatchLocationKey.isEmpty())
+                                ? sActiveWatchLocationKey : "notify";
 
-                            // Fields of Lnl5 / Lll5:
-                            // a = locationKey, b = longitude, c = latitude, d = affiliation, e = name
-                            XposedHelpers.setObjectField(placeObj, "a", activeKey);
-                            String latStr = coords != null ? String.format(Locale.US, "%.6f", coords[0]) : "25.038689";
-                            String lonStr = coords != null ? String.format(Locale.US, "%.6f", coords[1]) : "121.566210";
-                            if (activeKey.endsWith(",auto")) {
-                                String[] parts = activeKey.split(",");
-                                if (parts.length >= 2) {
-                                    latStr = parts[0];
-                                    lonStr = parts[1];
-                                }
+                        // Fields of Lll5 / Lnl5:
+                        // a = locationKey, b = longitude, c = latitude, d = affiliation, e = name
+                        HookBridge.setObjectField(placeObj, "a", activeKey);
+                        String latStr = coords != null ? String.format(Locale.US, "%.6f", coords[0]) : "25.038689";
+                        String lonStr = coords != null ? String.format(Locale.US, "%.6f", coords[1]) : "121.566210";
+                        if (activeKey.endsWith(",auto")) {
+                            String[] parts = activeKey.split(",");
+                            if (parts.length >= 2) {
+                                latStr = parts[0];
+                                lonStr = parts[1];
                             }
-                            XposedHelpers.setObjectField(placeObj, "c", latStr);
-                            XposedHelpers.setObjectField(placeObj, "b", lonStr);
-                            if (realCity != null && !realCity.isEmpty()) {
-                                XposedHelpers.setObjectField(placeObj, "d", realCity);
-                                XposedHelpers.setObjectField(placeObj, "e", realCity);
-                            }
-                            logInfo("[" + placeClass.getSimpleName() + ".a] Forced place model: key="
-                                    + XposedHelpers.getObjectField(placeObj, "a")
-                                    + ", name=" + XposedHelpers.getObjectField(placeObj, "e")
-                                    + ", lat=" + XposedHelpers.getObjectField(placeObj, "c")
-                                    + ", lon=" + XposedHelpers.getObjectField(placeObj, "b"));
-                        } catch (Throwable t) {
-                            logError("Error in " + placeClass.getSimpleName() + ".a hook", t);
                         }
+                        HookBridge.setObjectField(placeObj, "c", latStr);
+                        HookBridge.setObjectField(placeObj, "b", lonStr);
+                        if (realCity != null && !realCity.isEmpty()) {
+                            HookBridge.setObjectField(placeObj, "d", realCity);
+                            HookBridge.setObjectField(placeObj, "e", realCity);
+                        }
+                        logInfo("[" + placeClass.getSimpleName() + ".a] Forced place model: key="
+                                + HookBridge.getObjectField(placeObj, "a")
+                                + ", name=" + HookBridge.getObjectField(placeObj, "e")
+                                + ", lat=" + HookBridge.getObjectField(placeObj, "c")
+                                + ", lon=" + HookBridge.getObjectField(placeObj, "b"));
+                    } catch (Throwable t) {
+                        logError("Error in " + placeClass.getSimpleName() + ".a hook", t);
                     }
-                });
+                }
+            };
+            if (hasMethod(placeClass, "a", userPrefsClass, String.class, String.class)) {
+                HookBridge.findAndHookMethod(placeClass, "a", userPrefsClass, String.class, String.class, placeHook);
+                logInfo("Hooked Place Model builder: " + placeClass.getName() + ".a(UserPreferences, String, String)");
+            } else if (hasMethod(placeClass, "a", userPrefsClass)) {
+                HookBridge.findAndHookMethod(placeClass, "a", userPrefsClass, placeHook);
                 logInfo("Hooked Place Model builder: " + placeClass.getName() + ".a(UserPreferences)");
             }
         } catch (Throwable t) {
@@ -1012,12 +1118,12 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
     }
 
     // =========================================================================
-    // 4. Hook BLE Weather Endpoint 14 (Lnf8 in latest APK, Lkf8 in older APK)
+    // 4. Hook BLE Weather Endpoint 14 (Lkf8 in v24.1.1, Lnf8 in v24.0.3)
     // =========================================================================
     private void hookBleWeatherEndpoint14(final ClassLoader cl) {
         try {
             Class<?> ep14Class = null;
-            for (String candName : new String[]{"nf8", "kf8", "ud8", "tc8"}) {
+            for (String candName : new String[]{"kf8", "nf8", "ud8", "tc8"}) {
                 Class<?> c = findClassSafe(cl, candName);
                 if (c != null && hasMethod(c, "w") && hasMethod(c, "v") && hasMethod(c, "j") && hasMethod(c, "l")) {
                     ep14Class = c;
@@ -1025,17 +1131,28 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                 }
             }
             if (ep14Class == null) {
-                logError("CRITICAL: Could not find Endpoint 14 Weather Handler class (nf8/kf8)!", null);
+                logError("CRITICAL: Could not find Endpoint 14 Weather Handler class (kf8/nf8)!", null);
                 return;
             }
             sEndpoint14Class = ep14Class;
 
-            // Discover companion classes from ep14Class methods
+            // Discover companion classes & query method names dynamically by return type:
+            // v24.1.1 Lkf8: u()->Llf8 (protocol), x()->Lmf8 (settings), w()->ArrayList (raw 0x05 cities)
+            // v24.0.3 Lnf8: t()->Lof8 (protocol), w()->Lpf8 (settings), v()->ArrayList (raw 0x05 cities)
             Method mW = ep14Class.getDeclaredMethod("w");
-            sSettingsClass = mW.getReturnType(); // Lpf8 (latest) or Lmf8 (older)
-
-            Method mT = ep14Class.getDeclaredMethod("t");
-            sProtocolClass = mT.getReturnType(); // Lof8 (latest) or Llf8 (older)
+            if (ArrayList.class.isAssignableFrom(mW.getReturnType()) && hasMethod(ep14Class, "x") && hasMethod(ep14Class, "u")) {
+                sQueryProtocolMethodName = "u";
+                sQuerySettingsMethodName = "x";
+                sQueryCitiesMethodName = "w";
+                sProtocolClass = ep14Class.getDeclaredMethod("u").getReturnType();
+                sSettingsClass = ep14Class.getDeclaredMethod("x").getReturnType();
+            } else {
+                sQueryProtocolMethodName = "t";
+                sQuerySettingsMethodName = "w";
+                sQueryCitiesMethodName = "v";
+                sProtocolClass = ep14Class.getDeclaredMethod("t").getReturnType();
+                sSettingsClass = mW.getReturnType();
+            }
 
             for (Field f : sSettingsClass.getDeclaredFields()) {
                 if (f.getType() != Boolean.class && f.getType() != boolean.class) {
@@ -1044,12 +1161,13 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                 }
             }
 
-            // Determine shifted method names between Lnf8 (latest) and Lkf8 (older)
+            // Determine shifted method names between Lnf8 (v24.0.3) and Lkf8 (v24.1.1 / older)
             if (hasMethod(ep14Class, "B", sSettingsClass) && hasMethod(ep14Class, "C", sSettingsClass)) {
-                // Lnf8 layout: A(Luo0, String)=renameGnss, B(Lpf8)=writeSettings, C(Lpf8)=fallbackWrite, D(Luo0)=verifyDefault, E(Lpf8)=checkGnssUnavail, F(CountDownLatch)=updateLatch, G(byte[])=sendRawBle
+                // Lnf8 layout: B(Lpf8)=writeSettings, C(Lpf8)=fallbackWrite, D(Luo0)=verifyDefault, E(Lpf8)=checkGnssUnavail, F(CountDownLatch)=updateLatch, G(byte[])=sendRawBle
                 sWriteSettingsMethodName = "B";
                 sFallbackWriteMethodName = "C";
                 sVerifyDefaultMethodName = "D";
+                sCheckGnssUnavailMethodName = "E";
                 sLatchUpdateMethodName = "F";
                 sSendRawBleMethodName = "G";
             } else {
@@ -1057,6 +1175,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                 sWriteSettingsMethodName = "A";
                 sFallbackWriteMethodName = "B";
                 sVerifyDefaultMethodName = "C";
+                sCheckGnssUnavailMethodName = "D";
                 sLatchUpdateMethodName = "E";
                 sSendRawBleMethodName = "F";
             }
@@ -1065,12 +1184,13 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                     + ", settingsClass=" + sSettingsClass.getName()
                     + ", protocolClass=" + sProtocolClass.getName()
                     + ", cityClass=" + (sCityClass != null ? sCityClass.getName() : "null")
+                    + ", query(proto=" + sQueryProtocolMethodName + ",settings=" + sQuerySettingsMethodName + ",cities=" + sQueryCitiesMethodName + ")"
                     + ", writeSettings=" + sWriteSettingsMethodName
                     + ", sendRawBle=" + sSendRawBleMethodName);
 
             // 4.1 Hook m(protocol, settings) -> ALWAYS return null so Notify NEVER enters the broken GNSS rename branch!
             if (hasMethod(ep14Class, "m", sProtocolClass, sSettingsClass)) {
-                XposedHelpers.findAndHookMethod(ep14Class, "m", sProtocolClass, sSettingsClass, new XC_MethodHook() {
+                HookBridge.findAndHookMethod(ep14Class, "m", sProtocolClass, sSettingsClass, new HookBridge.MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         if (!isWeatherFixEnabled(cl)) return;
@@ -1080,10 +1200,9 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                 });
             }
 
-            // 4.2 Hook static E(Lpf8) / D(Lmf8) -> ALWAYS return false so Notify never aborts with "previously located GNSS city is temporarily unavailable"
-            String checkGnssMethod = "B".equals(sWriteSettingsMethodName) ? "E" : "D";
-            if (hasMethod(ep14Class, checkGnssMethod, sSettingsClass)) {
-                XposedHelpers.findAndHookMethod(ep14Class, checkGnssMethod, sSettingsClass, new XC_MethodHook() {
+            // 4.2 Hook static D(Lmf8) / E(Lpf8) -> ALWAYS return false so Notify never aborts with "previously located GNSS city is temporarily unavailable"
+            if (hasMethod(ep14Class, sCheckGnssUnavailMethodName, sSettingsClass)) {
+                HookBridge.findAndHookMethod(ep14Class, sCheckGnssUnavailMethodName, sSettingsClass, new HookBridge.MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         if (!isWeatherFixEnabled(cl)) return;
@@ -1095,7 +1214,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
             // 4.3 Hook static n(Context, UserPreferences) -> ALWAYS return our real city name (truncated to 16 chars if needed)
             Class<?> userPrefsClass = findClassSafe(cl, "com.mc.miband1.model.UserPreferences");
             if (userPrefsClass != null && hasMethod(ep14Class, "n", Context.class, userPrefsClass)) {
-                XposedHelpers.findAndHookMethod(ep14Class, "n", Context.class, userPrefsClass, new XC_MethodHook() {
+                HookBridge.findAndHookMethod(ep14Class, "n", Context.class, userPrefsClass, new HookBridge.MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
                         if (!isWeatherFixEnabled(cl)) return;
@@ -1109,14 +1228,14 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                 });
             }
 
-            // 4.4 Hook w() (queryWeatherSettings 0x0B) -> LOG the raw watch state and capture active GNSS locationKey (do NOT mutate b/c here!)
-            XposedHelpers.findAndHookMethod(ep14Class, "w", new XC_MethodHook() {
+            // 4.4 Hook x()/w() (queryWeatherSettings 0x0B) -> LOG the raw watch state and capture active GNSS locationKey (do NOT mutate b/c here!)
+            HookBridge.findAndHookMethod(ep14Class, sQuerySettingsMethodName, new HookBridge.MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
                     Object res = param.getResult();
                     if (res != null) {
                         try {
-                            Object bObj = XposedHelpers.getObjectField(res, "b");
+                            Object bObj = HookBridge.getObjectField(res, "b");
                             String bId = getCityId(bObj);
                             if (bId != null && !bId.isEmpty()) {
                                 sActiveWatchLocationKey = bId;
@@ -1124,12 +1243,12 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                         } catch (Throwable ignored) {
                         }
                     }
-                    logInfo("[" + sEndpoint14Class.getSimpleName() + ".w] Raw 0x0B Settings from Watch: " + formatSettingsObj(res));
+                    logInfo("[" + sEndpoint14Class.getSimpleName() + "." + sQuerySettingsMethodName + "] Raw 0x0B Settings from Watch: " + formatSettingsObj(res));
                 }
             });
 
             // 4.5 Hook writeSettings (B in Lnf8, A in Lkf8) -> Log exact 0x09 payload and result (NO destructive mutation!)
-            XposedHelpers.findAndHookMethod(ep14Class, sWriteSettingsMethodName, sSettingsClass, new XC_MethodHook() {
+            HookBridge.findAndHookMethod(ep14Class, sWriteSettingsMethodName, sSettingsClass, new HookBridge.MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
                     logInfo("[" + sEndpoint14Class.getSimpleName() + "." + sWriteSettingsMethodName + "] 0x09 Write "
@@ -1139,7 +1258,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
 
             // 4.6 Hook s(Luo0, boolean) -> Log exact 0x07 add/delete city call and result
             if (sCityClass != null && hasMethod(ep14Class, "s", sCityClass, boolean.class)) {
-                XposedHelpers.findAndHookMethod(ep14Class, "s", sCityClass, boolean.class, new XC_MethodHook() {
+                HookBridge.findAndHookMethod(ep14Class, "s", sCityClass, boolean.class, new HookBridge.MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
                         logInfo("[" + sEndpoint14Class.getSimpleName() + ".s] 0x07 "
@@ -1151,7 +1270,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
 
             // 4.7 Hook j(), l(), and F(CountDownLatch) / E(CountDownLatch) -> Replace with our deterministic Single-City Sync!
             if (hasMethod(ep14Class, "j")) {
-                XposedHelpers.findAndHookMethod(ep14Class, "j", new XC_MethodHook() {
+                HookBridge.findAndHookMethod(ep14Class, "j", new HookBridge.MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         if (!isWeatherFixEnabled(cl)) return;
@@ -1162,7 +1281,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                 });
             }
 
-            XposedHelpers.findAndHookMethod(ep14Class, "l", new XC_MethodHook() {
+            HookBridge.findAndHookMethod(ep14Class, "l", new HookBridge.MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
                     if (!isWeatherFixEnabled(cl)) return;
@@ -1173,13 +1292,13 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
             });
 
             if (hasMethod(ep14Class, sLatchUpdateMethodName, CountDownLatch.class)) {
-                XposedHelpers.findAndHookMethod(ep14Class, sLatchUpdateMethodName, CountDownLatch.class, new XC_MethodHook() {
+                HookBridge.findAndHookMethod(ep14Class, sLatchUpdateMethodName, CountDownLatch.class, new HookBridge.MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         if (!isWeatherFixEnabled(cl)) return;
                         CountDownLatch latch = (CountDownLatch) param.args[0];
                         try {
-                            XposedHelpers.setObjectField(param.thisObject, "c", latch);
+                            HookBridge.setObjectField(param.thisObject, "c", latch);
                         } catch (Throwable ignored) {
                         }
                         logInfo("[" + sEndpoint14Class.getSimpleName() + "." + sLatchUpdateMethodName + "] Intercepted latch city sync -> running performSingleCityWeatherSync");
@@ -1197,7 +1316,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
 
             // 4.8 Hook h() (background thread that sends empty settings after delay) -> block if our sync recently ran
             if (hasMethod(ep14Class, "h")) {
-                XposedHelpers.findAndHookMethod(ep14Class, "h", new XC_MethodHook() {
+                HookBridge.findAndHookMethod(ep14Class, "h", new HookBridge.MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         if (!isWeatherFixEnabled(cl)) return;
@@ -1210,7 +1329,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
             // 4.9 Hook o(BLEManager, String, HashMap) -> Inject "place" JSON into /weather/v6/ response & fix CBOR /weather/v5/
             Class<?> bleManagerClass = findClassSafe(cl, "com.mc.miband1.bluetooth.BLEManager", "com.mc.miband1.ble.BLEManager");
             if (bleManagerClass != null && hasMethod(ep14Class, "o", bleManagerClass, String.class, HashMap.class)) {
-                XposedHelpers.findAndHookMethod(ep14Class, "o", bleManagerClass, String.class, HashMap.class, new XC_MethodHook() {
+                HookBridge.findAndHookMethod(ep14Class, "o", bleManagerClass, String.class, HashMap.class, new HookBridge.MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         if (!isWeatherFixEnabled(cl)) return;
@@ -1252,10 +1371,10 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                         if (respWrapper == null) return;
                         try {
                             Object bleMgr = param.args[0];
-                            Context ctx = bleMgr != null ? (Context) XposedHelpers.getObjectField(bleMgr, "B") : sAppContext;
+                            Context ctx = bleMgr != null ? (Context) HookBridge.getObjectField(bleMgr, "B") : sAppContext;
                             Class<?> userPrefsClass = findClassSafe(cl, "com.mc.miband1.model.UserPreferences");
                             Object prefs = (userPrefsClass != null && ctx != null)
-                                    ? XposedHelpers.callStaticMethod(userPrefsClass, "getInstance", ctx)
+                                    ? HookBridge.callStaticMethod(userPrefsClass, "getInstance", ctx)
                                     : null;
                             if (queryMap != null && queryMap.containsKey("locationKey")) {
                                 String reqKey = queryMap.get("locationKey");
@@ -1263,11 +1382,11 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                                     sActiveWatchLocationKey = reqKey;
                                 }
                             }
-                            Class<?> v6WrapperClass = findClassSafe(cl, "a96", "y86", "y76");
+                            Class<?> v6WrapperClass = findClassSafe(cl, "v86", "a96", "y86", "y76");
                             if (v6WrapperClass != null && v6WrapperClass.isInstance(respWrapper)) {
                                 Object placeJson = buildPlaceJson(prefs, cl);
                                 if (placeJson != null) {
-                                    XposedHelpers.callMethod(respWrapper, "d", "place", placeJson);
+                                    HookBridge.callMethod(respWrapper, "d", "place", placeJson);
                                     logInfo("[" + sEndpoint14Class.getSimpleName() + ".o] Injected place into v6 response (" + path + "): " + placeJson);
                                 }
                             }
@@ -1308,9 +1427,9 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
             Object bleMgr = null;
             Context ctx = sAppContext;
             try {
-                bleMgr = XposedHelpers.getObjectField(ep14Instance, "b");
+                bleMgr = HookBridge.getObjectField(ep14Instance, "b");
                 if (bleMgr != null) {
-                    Context c = (Context) XposedHelpers.getObjectField(bleMgr, "B");
+                    Context c = (Context) HookBridge.getObjectField(bleMgr, "B");
                     if (c != null) ctx = c;
                 }
             } catch (Throwable ignored) {
@@ -1318,21 +1437,18 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
 
             Class<?> userPrefsClass = findClassSafe(cl, "com.mc.miband1.model.UserPreferences");
             Object prefs = (userPrefsClass != null && ctx != null)
-                    ? XposedHelpers.callStaticMethod(userPrefsClass, "getInstance", ctx)
+                    ? HookBridge.callStaticMethod(userPrefsClass, "getInstance", ctx)
                     : null;
 
             String rawCity = getRealCityName(cl);
             if ((rawCity == null || rawCity.isEmpty()) && prefs != null) {
-                try {
-                    rawCity = (String) XposedHelpers.callMethod(prefs, "A7");
-                } catch (Throwable ignored) {
-                }
+                rawCity = callUserPrefsCity(prefs);
             }
             if ((rawCity == null || rawCity.isEmpty()) && prefs != null) {
                 try {
-                    Object w7 = XposedHelpers.callMethod(prefs, "w7");
+                    Object w7 = callUserPrefsWeatherData(prefs, cl);
                     if (w7 != null) {
-                        rawCity = (String) XposedHelpers.getObjectField(w7, "i");
+                        rawCity = (String) HookBridge.getObjectField(w7, "i");
                     }
                 } catch (Throwable ignored) {
                 }
@@ -1349,16 +1465,16 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
             logInfo("=== [SingleCitySync] START === targetCity='" + cityName + "', realLat=" + sRealLatitude + ", realLon=" + sRealLongitude);
 
             // 1. Query Protocol (0x01), Current Settings (0x0B), and Saved Cities (0x05)
-            Object proto = XposedHelpers.callMethod(ep14Instance, "t");
-            Object initSettings = XposedHelpers.callMethod(ep14Instance, "w");
-            ArrayList<?> initCities = (ArrayList<?>) XposedHelpers.callMethod(ep14Instance, "v");
+            Object proto = HookBridge.callMethod(ep14Instance, sQueryProtocolMethodName);
+            Object initSettings = HookBridge.callMethod(ep14Instance, sQuerySettingsMethodName);
+            ArrayList<?> initCities = (ArrayList<?>) HookBridge.callMethod(ep14Instance, sQueryCitiesMethodName);
 
             logInfo("[SingleCitySync] INITIAL 0x01 Protocol: " + formatProtocolObj(proto));
             logInfo("[SingleCitySync] INITIAL 0x0B Settings: " + formatSettingsObj(initSettings));
             logInfo("[SingleCitySync] INITIAL 0x05 Cities (" + (initCities != null ? initCities.size() : 0) + "): " + formatCityList(initCities));
 
-            Object initB = initSettings != null ? XposedHelpers.getObjectField(initSettings, "b") : null;
-            Object initC = initSettings != null ? XposedHelpers.getObjectField(initSettings, "c") : null;
+            Object initB = initSettings != null ? HookBridge.getObjectField(initSettings, "b") : null;
+            Object initC = initSettings != null ? HookBridge.getObjectField(initSettings, "c") : null;
             String initBId = getCityId(initB);
             String initBName = getCityName(initB);
             String initCId = getCityId(initC);
@@ -1367,7 +1483,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
             if (initCities != null && !initCities.isEmpty()) {
                 for (Object cObj : initCities) {
                     if (cObj != null) {
-                        XposedHelpers.callMethod(ep14Instance, "s", cObj, false);
+                        HookBridge.callMethod(ep14Instance, "s", cObj, false);
                     }
                 }
             }
@@ -1385,7 +1501,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                     || (initBId != null && !targetAutoId.equals(initBId)));
             sActiveWatchLocationKey = targetAutoId;
 
-            Class<?> fc2Class = findClassSafe(cl, "fc2", "cc2");
+            Class<?> fc2Class = findClassSafe(cl, "ac2", "fc2", "cc2");
             if (bleMgr != null && fc2Class != null) {
                 try {
                     if (needForcePlaceRefresh) {
@@ -1401,7 +1517,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                         farBuf.putLong(nowMs - 1000L);
                         farBuf.putInt(latInt + 150000);
                         farBuf.putInt(lonInt + 150000);
-                        XposedHelpers.callStaticMethod(fc2Class, "g", bleMgr, 49, null, farBuf.array(), false);
+                        HookBridge.callStaticMethod(fc2Class, "g", bleMgr, 49, null, farBuf.array(), false);
                         Thread.sleep(150L);
                     }
 
@@ -1415,17 +1531,17 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                     vsBuf.putInt(lonInt);   // longitude * 3,000,000 (4B LE)
                     byte[] vsPayload = vsBuf.array();
 
-                    Object vsRes = XposedHelpers.callStaticMethod(fc2Class, "g", bleMgr, 49, null, vsPayload, false);
+                    Object vsRes = HookBridge.callStaticMethod(fc2Class, "g", bleMgr, 49, null, vsPayload, false);
                     logInfo("[SingleCitySync] Sent Endpoint 49 (VirtualSensor) GNSS location packet (forceRefresh="
                             + needForcePlaceRefresh + ") -> latInt=" + latInt
                             + ", lonInt=" + lonInt + ", targetAutoId='" + targetAutoId + "', res=" + vsRes);
 
                     Thread.sleep(350L);
                     if (!isHttpProxyBusyOrRecent(2000L)) {
-                        Object afterVsSettings = XposedHelpers.callMethod(ep14Instance, "w");
+                        Object afterVsSettings = HookBridge.callMethod(ep14Instance, sQuerySettingsMethodName);
                         logInfo("[SingleCitySync] AFTER Endpoint 49 0x0B Settings: " + formatSettingsObj(afterVsSettings));
                         if (afterVsSettings != null) {
-                            Object newB = XposedHelpers.getObjectField(afterVsSettings, "b");
+                            Object newB = HookBridge.getObjectField(afterVsSettings, "b");
                             String newBId = getCityId(newB);
                             if (newBId != null && !newBId.isEmpty()) {
                                 initB = newB;
@@ -1458,7 +1574,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                 chosenKey = "notify";
                 sActiveWatchLocationKey = chosenKey;
                 Object targetNotify = newCityInstance("notify", cityName);
-                boolean r07 = (Boolean) XposedHelpers.callMethod(ep14Instance, "s", targetNotify, true);
+                boolean r07 = (Boolean) HookBridge.callMethod(ep14Instance, "s", targetNotify, true);
                 boolean r04 = invokeWriteSettings(ep14Instance, newSettingsInstance(null, null, targetNotify));
                 logInfo("[SingleCitySync] Provisioned single 'notify' city '" + cityName + "' -> 07_add=" + r07 + ", 09_04=" + r04);
             }
@@ -1474,14 +1590,14 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                             "com.mc.miband1.model.modelXHelper");
                     if (modelXHelperClass != null) {
                         if (chosenKey.endsWith(",auto")) {
-                            XposedHelpers.callStaticMethod(modelXHelperClass, "l", "ee7ca29f-0509-4d04-b50d-54c09456e830", chosenKey);
-                            XposedHelpers.callStaticMethod(modelXHelperClass, "l", "55b48dd9-d16f-4b02-b971-cdc155fc6b7e", cityName);
-                            XposedHelpers.callStaticMethod(modelXHelperClass, "m", "6de38e8f-0c3c-445b-90fb-1a40d4b91572", true);
+                            HookBridge.callStaticMethod(modelXHelperClass, "l", "ee7ca29f-0509-4d04-b50d-54c09456e830", chosenKey);
+                            HookBridge.callStaticMethod(modelXHelperClass, "l", "55b48dd9-d16f-4b02-b971-cdc155fc6b7e", cityName);
+                            HookBridge.callStaticMethod(modelXHelperClass, "m", "6de38e8f-0c3c-445b-90fb-1a40d4b91572", true);
                         }
-                        String hash = (String) XposedHelpers.callStaticMethod(ep14Instance.getClass(), "i", prefs);
+                        String hash = (String) HookBridge.callStaticMethod(ep14Instance.getClass(), "i", prefs);
                         if (hash != null) {
-                            XposedHelpers.callStaticMethod(modelXHelperClass, "l", "d8fdf7ac-b858-4b6d-b582-878962001bac", hash);
-                            XposedHelpers.callStaticMethod(modelXHelperClass, "l", "849f2cf3-a86e-4399-9516-435a30477179", hash);
+                            HookBridge.callStaticMethod(modelXHelperClass, "l", "d8fdf7ac-b858-4b6d-b582-878962001bac", hash);
+                            HookBridge.callStaticMethod(modelXHelperClass, "l", "849f2cf3-a86e-4399-9516-435a30477179", hash);
                         }
                     }
                 } catch (Throwable ignored) {
@@ -1492,7 +1608,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
             if (!isHttpProxyBusyOrRecent(5000L)) {
                 try {
                     if (bleMgr != null && fc2Class != null) {
-                        Object res = XposedHelpers.callStaticMethod(fc2Class, "g", bleMgr, 1, null, new byte[]{0x12, 0x00}, false);
+                        Object res = HookBridge.callStaticMethod(fc2Class, "g", bleMgr, 1, null, new byte[]{0x12, 0x00}, false);
                         logInfo("[SingleCitySync] Sent [0x12, 0x00] on Endpoint 1 (bleMgr=" + bleMgr.getClass().getSimpleName() + ") -> " + res);
                     } else {
                         logError("[SingleCitySync] Cannot send [0x12, 0x00]: bleMgr=" + bleMgr + ", fc2Class=" + fc2Class, null);
@@ -1509,7 +1625,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                 try {
                     Thread.sleep(10000L);
                     waitHttpProxyIdle(cl, 8000L);
-                    Object verifySettings = XposedHelpers.callMethod(ep14Ref, "w");
+                    Object verifySettings = HookBridge.callMethod(ep14Ref, sQuerySettingsMethodName);
                     logInfo("[WeatherGnssSettingsRefresh] Post-HTTP 0x0B Settings on Watch: " + formatSettingsObj(verifySettings));
                 } catch (Throwable ignored) {
                 }
@@ -1553,7 +1669,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
     private static boolean invokeWriteSettings(Object ep14Instance, Object settingsObj) {
         if (ep14Instance == null || settingsObj == null) return false;
         try {
-            Object res = XposedHelpers.callMethod(ep14Instance, sWriteSettingsMethodName, settingsObj);
+            Object res = HookBridge.callMethod(ep14Instance, sWriteSettingsMethodName, settingsObj);
             return res instanceof Boolean && (Boolean) res;
         } catch (Throwable t) {
             logError("invokeWriteSettings failed", t);
@@ -1564,7 +1680,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
     private static String getCityId(Object cityObj) {
         if (cityObj == null) return null;
         try {
-            return (String) XposedHelpers.getObjectField(cityObj, "a");
+            return (String) HookBridge.getObjectField(cityObj, "a");
         } catch (Throwable ignored) {
             return null;
         }
@@ -1573,7 +1689,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
     private static String getCityName(Object cityObj) {
         if (cityObj == null) return null;
         try {
-            return (String) XposedHelpers.getObjectField(cityObj, "b");
+            return (String) HookBridge.getObjectField(cityObj, "b");
         } catch (Throwable ignored) {
             return null;
         }
@@ -1587,9 +1703,9 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
     private static String formatSettingsObj(Object settingsObj) {
         if (settingsObj == null) return "null";
         try {
-            Object a = XposedHelpers.getObjectField(settingsObj, "a");
-            Object b = XposedHelpers.getObjectField(settingsObj, "b");
-            Object c = XposedHelpers.getObjectField(settingsObj, "c");
+            Object a = HookBridge.getObjectField(settingsObj, "a");
+            Object b = HookBridge.getObjectField(settingsObj, "b");
+            Object c = HookBridge.getObjectField(settingsObj, "c");
             return "{a=" + a + ", b=" + formatCityObj(b) + ", c=" + formatCityObj(c) + "}";
         } catch (Throwable ignored) {
             return String.valueOf(settingsObj);
@@ -1599,8 +1715,8 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
     private static String formatProtocolObj(Object protoObj) {
         if (protoObj == null) return "null";
         try {
-            Object a = XposedHelpers.getObjectField(protoObj, "a");
-            Object b = XposedHelpers.getObjectField(protoObj, "b");
+            Object a = HookBridge.getObjectField(protoObj, "a");
+            Object b = HookBridge.getObjectField(protoObj, "b");
             return "{version=" + a + ", supported=" + b + "}";
         } catch (Throwable ignored) {
             return String.valueOf(protoObj);
@@ -1619,90 +1735,73 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
     }
 
     // =========================================================================
-    // 6. Hook Weather v6 JSON Builder (Lz38 in latest APK, Lmh7 in older APK)
+    // 6. Hook Weather v6 JSON Builder (Lq38 in v24.1.1, Lz38 in v24.0.3, Lmh7 in older APK)
     // =========================================================================
     private void hookPlaceJsonBuilder(final ClassLoader cl) {
         try {
             Class<?> userPrefsClass = findClassSafe(cl, "com.mc.miband1.model.UserPreferences");
-            Class<?> weatherDataClass = findClassSafe(cl, "re8", "oe8");
-            Class<?> hourlyItemClass = findClassSafe(cl, "zo2", "of8");
-            Class<?> u51Class = findClassSafe(cl, "u51");
-            Class<?> builderClass = findClassSafe(cl, "z38", "mh7", "lg7");
+            Class<?> weatherDataClass = resolveWeatherDataClass(cl);
+            Class<?> u51Class = findClassSafe(cl, "v51", "u51");
+            Class<?> builderClass = findClassSafe(cl, "q38", "z38", "mh7", "lg7");
 
             if (builderClass == null || userPrefsClass == null) {
-                logError("Could not find Weather v6 JSON Builder class (z38/mh7)", null);
+                logError("Could not find Weather v6 JSON Builder class (q38/z38/mh7)", null);
                 return;
             }
 
-            // 6.1 Hook place JSON builder: E(UserPreferences) in Lz38, t(UserPreferences) in Lmh7
-            String placeMethodName = hasMethod(builderClass, "E", userPrefsClass) ? "E"
-                    : (hasMethod(builderClass, "t", userPrefsClass) ? "t" : null);
-            if (placeMethodName != null) {
-                XposedHelpers.findAndHookMethod(builderClass, placeMethodName, userPrefsClass, new XC_MethodHook() {
+            // 6.1 Hook place JSON builder: D(UserPreferences, String) in Lq38 (v24.1.1), E(UserPreferences) in Lz38, t(UserPreferences) in Lmh7
+            String placeMethodName = null;
+            if (hasMethod(builderClass, "D", userPrefsClass, String.class)) {
+                placeMethodName = "D";
+                HookBridge.findAndHookMethod(builderClass, "D", userPrefsClass, String.class, new HookBridge.MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
                         if (!isWeatherFixEnabled(cl)) return;
                         Object place = buildPlaceJson(param.args[0], cl);
                         if (place != null) {
                             param.setResult(place);
-                            logInfo("[" + builderClass.getSimpleName() + "." + placeMethodName + "] Built place JSON: " + place);
+                            logInfo("[" + builderClass.getSimpleName() + ".D] Built place JSON: " + place);
                         }
                     }
                 });
-            }
-
-            // 6.1b Hook CBOR /weather/v5/ place builder: Lnl5.a(UserPreferences)
-            Class<?> nl5Class = findClassSafe(cl, "nl5", "kl5", "jl5");
-            if (nl5Class != null && hasMethod(nl5Class, "a", userPrefsClass)) {
-                XposedHelpers.findAndHookMethod(nl5Class, "a", userPrefsClass, new XC_MethodHook() {
-                    @Override
-                    protected void afterHookedMethod(MethodHookParam param) {
-                        if (!isWeatherFixEnabled(cl)) return;
-                        Object nl5 = param.getResult();
-                        if (nl5 == null) return;
-                        try {
-                            loadRealLocationFromPrefs(cl);
-                            String cityName = getRealCityName(cl);
-                            if (cityName != null && !cityName.isEmpty()) {
-                                XposedHelpers.setObjectField(nl5, "d", cityName);
-                                XposedHelpers.setObjectField(nl5, "e", cityName);
+            } else {
+                placeMethodName = hasMethod(builderClass, "E", userPrefsClass) ? "E"
+                        : (hasMethod(builderClass, "t", userPrefsClass) ? "t" : null);
+                if (placeMethodName != null) {
+                    final String pm = placeMethodName;
+                    HookBridge.findAndHookMethod(builderClass, placeMethodName, userPrefsClass, new HookBridge.MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            if (!isWeatherFixEnabled(cl)) return;
+                            Object place = buildPlaceJson(param.args[0], cl);
+                            if (place != null) {
+                                param.setResult(place);
+                                logInfo("[" + builderClass.getSimpleName() + "." + pm + "] Built place JSON: " + place);
                             }
-                            if (sActiveWatchLocationKey != null && !sActiveWatchLocationKey.isEmpty()) {
-                                XposedHelpers.setObjectField(nl5, "a", sActiveWatchLocationKey);
-                                if (sActiveWatchLocationKey.endsWith(",auto")) {
-                                    String[] parts = sActiveWatchLocationKey.split(",");
-                                    if (parts.length >= 2) {
-                                        XposedHelpers.setObjectField(nl5, "c", parts[0]);
-                                        XposedHelpers.setObjectField(nl5, "b", parts[1]);
-                                    }
-                                }
-                            }
-                            logInfo("[" + nl5Class.getSimpleName() + ".a] Built CBOR v5 place: key='"
-                                    + XposedHelpers.getObjectField(nl5, "a") + "', name='"
-                                    + XposedHelpers.getObjectField(nl5, "e") + "'");
-                        } catch (Throwable ignored) {
                         }
-                    }
-                });
+                    });
+                }
             }
 
-            // 6.2 Hook hourly forecast JSON builder: z(UserPreferences, Lre8) in Lz38, p(UserPreferences, Loe8) in Lmh7
-            // AND hourlyAirQuality builder: w(Lre8) in Lz38
+            // 6.2 Hook hourly forecast JSON builder: x(UserPreferences, Loe8) in Lq38, z(UserPreferences, Lre8) in Lz38, p in Lmh7
+            // AND hourlyAirQuality builder: u(Loe8) in Lq38, w(Lre8) in Lz38
             if (weatherDataClass != null) {
-                String hourlyMethodName = hasMethod(builderClass, "z", userPrefsClass, weatherDataClass) ? "z"
-                        : (hasMethod(builderClass, "p", userPrefsClass, weatherDataClass) ? "p" : null);
+                String hourlyMethodName = hasMethod(builderClass, "x", userPrefsClass, weatherDataClass) ? "x"
+                        : (hasMethod(builderClass, "z", userPrefsClass, weatherDataClass) ? "z"
+                        : (hasMethod(builderClass, "p", userPrefsClass, weatherDataClass) ? "p" : null));
                 if (hourlyMethodName != null) {
-                    XposedHelpers.findAndHookMethod(builderClass, hourlyMethodName, userPrefsClass, weatherDataClass, new XC_MethodHook() {
+                    final String hm = hourlyMethodName;
+                    HookBridge.findAndHookMethod(builderClass, hourlyMethodName, userPrefsClass, weatherDataClass, new HookBridge.MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
                             if (!isWeatherFixEnabled(cl)) return;
                             Object weatherData = param.args[1];
                             if (weatherData == null) return;
                             try {
-                                ArrayList<?> hourlyList = (ArrayList<?>) XposedHelpers.getObjectField(weatherData, "A");
+                                ArrayList<?> hourlyList = (ArrayList<?>) HookBridge.getObjectField(weatherData, "A");
                                 if ((hourlyList == null || hourlyList.isEmpty()) && sCachedHourlyForecastList != null && !sCachedHourlyForecastList.isEmpty()) {
-                                    XposedHelpers.setObjectField(weatherData, "A", new ArrayList<>(sCachedHourlyForecastList));
-                                    logInfo("[" + builderClass.getSimpleName() + "." + hourlyMethodName + "] Restored "
+                                    HookBridge.setObjectField(weatherData, "A", new ArrayList<>(sCachedHourlyForecastList));
+                                    logInfo("[" + builderClass.getSimpleName() + "." + hm + "] Restored "
                                             + sCachedHourlyForecastList.size() + " cached hourly forecast entries before building JSON");
                                 }
                                 sanitizeWeatherDataFeelsLike(weatherData);
@@ -1712,8 +1811,10 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                     });
                 }
 
-                if (hasMethod(builderClass, "w", weatherDataClass)) {
-                    XposedHelpers.findAndHookMethod(builderClass, "w", weatherDataClass, new XC_MethodHook() {
+                String aqMethodName = hasMethod(builderClass, "u", weatherDataClass) ? "u"
+                        : (hasMethod(builderClass, "w", weatherDataClass) ? "w" : null);
+                if (aqMethodName != null) {
+                    HookBridge.findAndHookMethod(builderClass, aqMethodName, weatherDataClass, new HookBridge.MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
                             if (!isWeatherFixEnabled(cl)) return;
@@ -1728,14 +1829,15 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                 }
             }
 
-            // 6.3 Hook single-hour fallback builder: i(UserPreferences, Lu51, Lrf8, double, long) in Lz38
-            Class<?> rf8Class = findClassSafe(cl, "rf8", "of8");
+            // 6.3 Hook single-hour fallback builder: h(UserPreferences, Lv51, Lof8, double, long) in Lq38, i in Lz38, f in Lmh7
+            Class<?> rf8Class = findClassSafe(cl, "of8", "rf8");
             if (u51Class != null && rf8Class != null) {
-                String fallbackHourMethod = hasMethod(builderClass, "i", userPrefsClass, u51Class, rf8Class, double.class, long.class) ? "i"
-                        : (hasMethod(builderClass, "f", userPrefsClass, u51Class, rf8Class, double.class, long.class) ? "f" : null);
+                String fallbackHourMethod = hasMethod(builderClass, "h", userPrefsClass, u51Class, rf8Class, double.class, long.class) ? "h"
+                        : (hasMethod(builderClass, "i", userPrefsClass, u51Class, rf8Class, double.class, long.class) ? "i"
+                        : (hasMethod(builderClass, "f", userPrefsClass, u51Class, rf8Class, double.class, long.class) ? "f" : null));
                 if (fallbackHourMethod != null) {
-                    XposedHelpers.findAndHookMethod(builderClass, fallbackHourMethod,
-                            userPrefsClass, u51Class, rf8Class, double.class, long.class, new XC_MethodHook() {
+                    HookBridge.findAndHookMethod(builderClass, fallbackHourMethod,
+                            userPrefsClass, u51Class, rf8Class, double.class, long.class, new HookBridge.MethodHook() {
                                 @Override
                                 protected void beforeHookedMethod(MethodHookParam param) {
                                     if (!isWeatherFixEnabled(cl)) return;
@@ -1745,16 +1847,18 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                 }
             }
 
-            // 6.4 Hook single-hour JSON item builder: y(J, String, D, D, D, I, I, D, Double, Double, D, Z) in Lz38
-            String singleHourMethod = hasMethod(builderClass, "y", long.class, String.class, double.class, double.class,
+            // 6.4 Hook single-hour JSON item builder: w(...) in Lq38, y(...) in Lz38, o(...) in Lmh7
+            String singleHourMethod = hasMethod(builderClass, "w", long.class, String.class, double.class, double.class,
+                    double.class, int.class, int.class, double.class, Double.class, Double.class, double.class, boolean.class) ? "w"
+                    : (hasMethod(builderClass, "y", long.class, String.class, double.class, double.class,
                     double.class, int.class, int.class, double.class, Double.class, Double.class, double.class, boolean.class) ? "y"
                     : (hasMethod(builderClass, "o", long.class, String.class, double.class, double.class,
-                    double.class, int.class, int.class, double.class, Double.class, Double.class, double.class, boolean.class) ? "o" : null);
+                    double.class, int.class, int.class, double.class, Double.class, Double.class, double.class, boolean.class) ? "o" : null));
             if (singleHourMethod != null) {
-                XposedHelpers.findAndHookMethod(builderClass, singleHourMethod,
+                HookBridge.findAndHookMethod(builderClass, singleHourMethod,
                         long.class, String.class, double.class, double.class, double.class,
                         int.class, int.class, double.class, Double.class, Double.class, double.class, boolean.class,
-                        new XC_MethodHook() {
+                        new HookBridge.MethodHook() {
                             @Override
                             protected void beforeHookedMethod(MethodHookParam param) {
                                 if (!isWeatherFixEnabled(cl)) return;
@@ -1774,7 +1878,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                         });
             }
 
-            logInfo("Hooked Weather v6 JSON Builder: " + builderClass.getName() + " (place=" + placeMethodName + ")");
+            logInfo("Hooked Weather v6 JSON Builder: " + builderClass.getName() + " (place=" + placeMethodName + ", singleHour=" + singleHourMethod + ")");
         } catch (Throwable t) {
             logError("hookPlaceJsonBuilder failed", t);
         }
@@ -1785,10 +1889,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
             loadRealLocationFromPrefs(cl);
             String cityName = getRealCityName(cl);
             if ((cityName == null || cityName.isEmpty()) && userPrefs != null) {
-                try {
-                    cityName = (String) XposedHelpers.callMethod(userPrefs, "A7");
-                } catch (Throwable ignored) {
-                }
+                cityName = callUserPrefsCity(userPrefs);
             }
             if (cityName == null || cityName.trim().isEmpty()) {
                 cityName = "Taipei";
@@ -1816,7 +1917,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
             String addPropName = hasMethod(jsonObjClass, "r", String.class, String.class) ? "r" : "addProperty";
             Method addProp = jsonObjClass.getDeclaredMethod(addPropName, String.class, String.class);
             addProp.setAccessible(true);
-            // Exact schema of Lz38.E(UserPreferences): locationKey, longitude, latitude, affiliation, name, countryCode=null (JsonNull.f)
+            // Exact schema of Lq38.D / Lz38.E: locationKey, longitude, latitude, affiliation, name, countryCode=null (JsonNull.f)
             addProp.invoke(place, "locationKey", locKey);
             addProp.invoke(place, "longitude", lonStr);
             addProp.invoke(place, "latitude", latStr);
@@ -1831,19 +1932,32 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
     }
 
     // =========================================================================
-    // 7. Hook BLE HTTP Proxy (Lev5 in latest APK, Lcv5 in older APK)
+    // 7. Hook BLE HTTP Proxy (Lzu5 in v24.1.1, Lev5 in v24.0.3, Lcv5 in older APK)
     // =========================================================================
     private void hookBleHttpProxy(final ClassLoader cl) {
         try {
-            Class<?> proxyClass = findClassSafe(cl, "ev5", "cv5");
+            Class<?> proxyClass = findClassSafe(cl, "zu5", "ev5", "cv5");
             if (proxyClass == null) {
-                logError("Could not find BLE HTTP Proxy class (ev5/cv5)", null);
+                logError("Could not find BLE HTTP Proxy class (zu5/ev5/cv5)", null);
                 return;
             }
-            if (hasMethod(proxyClass, "h", byte.class, String.class, String.class, java.util.LinkedHashMap.class)) {
-                XposedHelpers.findAndHookMethod(proxyClass, "h",
+            Class<?> xpClass = findClassSafe(cl, "xp");
+            if (xpClass != null && hasMethod(proxyClass, "f", xpClass, int.class, byte[].class)) {
+                HookBridge.findAndHookMethod(proxyClass, "f", xpClass, int.class, byte[].class, new HookBridge.MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        byte[] data = (byte[]) param.args[2];
+                        if (data != null && data.length > 1 && data[0] == 1) {
+                            sLastHttpProxyTimeMs = System.currentTimeMillis();
+                            logInfo("[" + proxyClass.getSimpleName() + ".f] Watch HTTP Proxy Request (id=" + data[1] + ", bytes=" + data.length + ")");
+                        }
+                    }
+                });
+                logInfo("Hooked BLE HTTP Proxy: " + proxyClass.getName() + ".f(Lxp, int, byte[])");
+            } else if (hasMethod(proxyClass, "h", byte.class, String.class, String.class, java.util.LinkedHashMap.class)) {
+                HookBridge.findAndHookMethod(proxyClass, "h",
                         byte.class, String.class, String.class, java.util.LinkedHashMap.class,
-                        new XC_MethodHook() {
+                        new HookBridge.MethodHook() {
                             @Override
                             protected void beforeHookedMethod(MethodHookParam param) {
                                 sLastHttpProxyTimeMs = System.currentTimeMillis();
@@ -1855,8 +1969,11 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                         });
                 logInfo("Hooked BLE HTTP Proxy: " + proxyClass.getName() + ".h()");
             }
-            if (hasMethod(proxyClass, "m", int.class, int.class, byte[].class)) {
-                XposedHelpers.findAndHookMethod(proxyClass, "m", int.class, int.class, byte[].class, new XC_MethodHook() {
+            String respSendMethod = hasMethod(proxyClass, "k", int.class, int.class, byte[].class) ? "k"
+                    : (hasMethod(proxyClass, "m", int.class, int.class, byte[].class) ? "m" : null);
+            if (respSendMethod != null) {
+                final String rm = respSendMethod;
+                HookBridge.findAndHookMethod(proxyClass, respSendMethod, int.class, int.class, byte[].class, new HookBridge.MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         sActiveHttpProxyCount.incrementAndGet();
@@ -1868,16 +1985,16 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                         sActiveHttpProxyCount.decrementAndGet();
                         sLastHttpProxyTimeMs = System.currentTimeMillis();
                         byte[] body = (byte[]) param.args[2];
-                        logInfo("[" + proxyClass.getSimpleName() + ".m] Watch HTTP Proxy Response BLE transfer finished (reqId="
+                        logInfo("[" + proxyClass.getSimpleName() + "." + rm + "] Watch HTTP Proxy Response BLE transfer finished (reqId="
                                 + param.args[0] + ", status=" + param.args[1] + ", bytes=" + (body != null ? body.length : 0)
                                 + ") -> result=" + param.getResult());
                     }
                 });
-                logInfo("Hooked BLE HTTP Proxy response sender: " + proxyClass.getName() + ".m(int, int, byte[])");
+                logInfo("Hooked BLE HTTP Proxy response sender: " + proxyClass.getName() + "." + respSendMethod + "(int, int, byte[])");
             } else {
-                Class<?> respClass = findClassSafe(cl, "s86", "q86");
+                Class<?> respClass = findClassSafe(cl, "n86", "s86", "q86");
                 if (respClass != null && hasMethod(proxyClass, "m", respClass)) {
-                    XposedHelpers.findAndHookMethod(proxyClass, "m", respClass, new XC_MethodHook() {
+                    HookBridge.findAndHookMethod(proxyClass, "m", respClass, new HookBridge.MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
                             sActiveHttpProxyCount.incrementAndGet();
@@ -1917,17 +2034,36 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
     }
 
     // =========================================================================
-    // 8. Hook WeatherActivity Manual Update UI Click (Ldy in latest APK, Lse8 in older APK)
+    // 8. Hook WeatherActivity Manual Update UI Click (WeatherActivity.p0 in v24.1.1, Ldy/Lse8 in older APKs)
     // =========================================================================
     private void hookWeatherActivityUI(final ClassLoader cl) {
         try {
-            Class<?> clickClass = findClassSafe(cl, "dy", "se8", "cd8");
-            if (clickClass != null && hasMethod(clickClass, " onClick".trim(), android.view.View.class)) {
-                XposedHelpers.findAndHookMethod(clickClass, "onClick", android.view.View.class, new XC_MethodHook() {
+            Class<?> weatherActClass = findClassSafe(cl, "com.mc.miband1.ui.weather.WeatherActivity");
+            if (weatherActClass != null && hasMethod(weatherActClass, "p0")) {
+                HookBridge.findAndHookMethod(weatherActClass, "p0", new HookBridge.MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
                         try {
-                            Object target = XposedHelpers.getObjectField(param.thisObject, "i");
+                            if (param.thisObject instanceof Context) {
+                                Context ctx = (Context) param.thisObject;
+                                logInfo("[WeatherActivity.p0] Manual update clicked -> triggering AGPS update & location reload");
+                                loadRealLocationFromPrefs(cl);
+                                triggerAgpsUpdate(ctx, cl, false);
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                });
+                logInfo("Hooked WeatherActivity manual update method: WeatherActivity.p0()");
+                return;
+            }
+            Class<?> clickClass = findClassSafe(cl, "dy", "se8", "cd8");
+            if (clickClass != null && hasMethod(clickClass, "onClick", android.view.View.class)) {
+                HookBridge.findAndHookMethod(clickClass, "onClick", android.view.View.class, new HookBridge.MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        try {
+                            Object target = HookBridge.getObjectField(param.thisObject, "i");
                             if (target != null && target.getClass().getName().endsWith("WeatherActivity")) {
                                 Context ctx = (Context) target;
                                 logInfo("[WeatherActivity] Manual update button clicked -> triggering AGPS update & location reload");
@@ -1946,40 +2082,62 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
     }
 
     // =========================================================================
-    // 9. Hook Internal Dispatcher & Logger (Le48 in latest APK, Lb48 in older APK)
+    // 9. Hook Internal Dispatcher & Logger (Lv38 in v24.1.1, Le48/Lb48 in older APKs)
     // =========================================================================
     private void hookBroadcastFailureOverride(final ClassLoader cl) {
         try {
-            Class<?> dispatcherClass = findClassSafe(cl, "e48", "b48");
+            Class<?> dispatcherClass = findClassSafe(cl, "v38", "e48", "b48");
             if (dispatcherClass == null) return;
 
             // Convert weatherUpdateFailed into weatherUpdated when our custom sync succeeded
-            if (hasMethod(dispatcherClass, "r2", Context.class, String.class)) {
-                XposedHelpers.findAndHookMethod(dispatcherClass, "r2", Context.class, String.class, new XC_MethodHook() {
+            String strBroadcastMethod = hasMethod(dispatcherClass, "h2", Context.class, String.class) ? "h2"
+                    : (hasMethod(dispatcherClass, "r2", Context.class, String.class) ? "r2" : null);
+            if (strBroadcastMethod != null) {
+                final String bm = strBroadcastMethod;
+                HookBridge.findAndHookMethod(dispatcherClass, strBroadcastMethod, Context.class, String.class, new HookBridge.MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         if (!isWeatherFixEnabled(cl)) return;
                         String action = (String) param.args[1];
-                        if ("com.mc.miband.weatherUpdateFailed".equals(action)) {
-                            logInfo("[" + dispatcherClass.getSimpleName() + ".r2] Intercepted weatherUpdateFailed -> overriding to weatherUpdated");
+                        if (ACTION_NOTIFY_WEATHER_FAILED_UUID.equals(action)) {
+                            logInfo("[" + dispatcherClass.getSimpleName() + "." + bm + "] Intercepted weatherUpdateFailed UUID -> overriding to weatherUpdated UUID");
+                            param.args[1] = ACTION_NOTIFY_WEATHER_UPDATED_UUID;
+                        } else if ("com.mc.miband.weatherUpdateFailed".equals(action)) {
+                            logInfo("[" + dispatcherClass.getSimpleName() + "." + bm + "] Intercepted weatherUpdateFailed -> overriding to weatherUpdated");
                             param.args[1] = "com.mc.miband.weatherUpdated";
                         }
                     }
                 });
             }
 
-            // Forward internal Notify logs for nf8/kf8/ev5/cv5/lf8/if8/ey/uv (AGPS & Weather) to LSPosed log!
+            if (hasMethod(dispatcherClass, "g2", Context.class, Intent.class)) {
+                HookBridge.findAndHookMethod(dispatcherClass, "g2", Context.class, Intent.class, new HookBridge.MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        if (!isWeatherFixEnabled(cl)) return;
+                        Intent intent = (Intent) param.args[1];
+                        if (intent == null) return;
+                        String action = intent.getAction();
+                        if (ACTION_NOTIFY_WEATHER_FAILED_UUID.equals(action)) {
+                            logInfo("[" + dispatcherClass.getSimpleName() + ".g2] Intercepted weatherUpdateFailed Intent -> overriding to weatherUpdated UUID");
+                            intent.setAction(ACTION_NOTIFY_WEATHER_UPDATED_UUID);
+                        }
+                    }
+                });
+            }
+
+            // Forward internal Notify logs for legacy builds (Le48.h)
             if (hasMethod(dispatcherClass, "h", Context.class, String.class, String.class, Exception.class)) {
-                XposedHelpers.findAndHookMethod(dispatcherClass, "h",
-                        Context.class, String.class, String.class, Exception.class, new XC_MethodHook() {
+                HookBridge.findAndHookMethod(dispatcherClass, "h",
+                        Context.class, String.class, String.class, Exception.class, new HookBridge.MethodHook() {
                             @Override
                             protected void beforeHookedMethod(MethodHookParam param) {
                                 String tag = (String) param.args[1];
                                 String msg = (String) param.args[2];
                                 if ((tag != null && (tag.equals("nf8") || tag.equals("kf8")
-                                        || tag.equals("ev5") || tag.equals("cv5")
+                                        || tag.equals("ev5") || tag.equals("cv5") || tag.equals("zu5")
                                         || tag.equals("lf8") || tag.equals("if8")
-                                        || tag.equals("ey") || tag.equals("uv") || tag.equals("l8") || tag.equals("as")))
+                                        || tag.equals("ey") || tag.equals("uv") || tag.equals("sv") || tag.equals("l8") || tag.equals("as")))
                                         || (msg != null && (msg.contains("Weather HTTP") || msg.contains("weather HTTP")))) {
                                     logInfo("[NotifyInternal:" + tag + "] " + msg);
                                 }
@@ -1987,7 +2145,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                         });
             }
 
-            logInfo("Hooked internal broadcast dispatcher & logger: " + dispatcherClass.getName());
+            logInfo("Hooked internal broadcast dispatcher & logger: " + dispatcherClass.getName() + " (strBroadcast=" + strBroadcastMethod + ")");
         } catch (Throwable t) {
             logError("hookBroadcastFailureOverride failed", t);
         }
@@ -2033,10 +2191,10 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
         loadRealLocationFromPrefs(cl);
         if (userPrefs != null) {
             try {
-                Object w7 = XposedHelpers.callMethod(userPrefs, "w7");
+                Object w7 = callUserPrefsWeatherData(userPrefs, cl);
                 if (w7 != null) {
-                    double wLat = XposedHelpers.getDoubleField(w7, "q");
-                    double wLon = XposedHelpers.getDoubleField(w7, "w");
+                    double wLat = HookBridge.getDoubleField(w7, "q");
+                    double wLon = HookBridge.getDoubleField(w7, "w");
                     if (Math.abs(wLat) > 0.001 || Math.abs(wLon) > 0.001) {
                         sRealLatitude = wLat;
                         sRealLongitude = wLon;
@@ -2045,15 +2203,11 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                 }
             } catch (Throwable ignored) {
             }
-            try {
-                double lat = (Double) XposedHelpers.callMethod(userPrefs, "o6");
-                double lon = (Double) XposedHelpers.callMethod(userPrefs, "p6");
-                if (Math.abs(lat) > 0.001 || Math.abs(lon) > 0.001) {
-                    sRealLatitude = lat;
-                    sRealLongitude = lon;
-                    return new double[]{lat, lon};
-                }
-            } catch (Throwable ignored) {
+            double[] latLon = callUserPrefsLatLon(userPrefs);
+            if (latLon != null) {
+                sRealLatitude = latLon[0];
+                sRealLongitude = latLon[1];
+                return latLon;
             }
         }
         if (sRealLatitude != null && sRealLongitude != null
@@ -2069,14 +2223,14 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
             if (userPrefsClass == null) return;
             String freshW7City = null;
             if (sAppContext != null) {
-                Object prefs = XposedHelpers.callStaticMethod(userPrefsClass, "getInstance", sAppContext);
+                Object prefs = HookBridge.callStaticMethod(userPrefsClass, "getInstance", sAppContext);
                 if (prefs != null) {
                     try {
-                        Object w7 = XposedHelpers.callMethod(prefs, "w7");
+                        Object w7 = callUserPrefsWeatherData(prefs, cl);
                         if (w7 != null) {
-                            String wCity = (String) XposedHelpers.getObjectField(w7, "i");
-                            double wLat = XposedHelpers.getDoubleField(w7, "q");
-                            double wLon = XposedHelpers.getDoubleField(w7, "w");
+                            String wCity = (String) HookBridge.getObjectField(w7, "i");
+                            double wLat = HookBridge.getDoubleField(w7, "q");
+                            double wLon = HookBridge.getDoubleField(w7, "w");
                             if (wCity != null && !wCity.trim().isEmpty()
                                     && !"Hengke Village".equalsIgnoreCase(wCity.trim())
                                     && !"興隆里".equals(wCity.trim())) {
@@ -2090,18 +2244,14 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                         }
                     } catch (Throwable ignored) {
                     }
-                    try {
-                        double lat = (Double) XposedHelpers.callMethod(prefs, "o6");
-                        double lon = (Double) XposedHelpers.callMethod(prefs, "p6");
-                        if (Math.abs(lat) > 0.001 || Math.abs(lon) > 0.001) {
-                            sRealLatitude = lat;
-                            sRealLongitude = lon;
-                        }
-                    } catch (Throwable ignored) {
+                    double[] latLon = callUserPrefsLatLon(prefs);
+                    if (latLon != null) {
+                        sRealLatitude = latLon[0];
+                        sRealLongitude = latLon[1];
                     }
                 }
             }
-            SharedPreferences sp = (SharedPreferences) XposedHelpers.callStaticMethod(userPrefsClass, "N6");
+            SharedPreferences sp = getNotifySharedPrefs(cl);
             if (sp != null) {
                 if (freshW7City == null) {
                     String savedCustomCity = sp.getString("balance2_real_city", null);
@@ -2126,9 +2276,9 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                 }
             }
             if ((sRealCityName == null || sRealCityName.isEmpty()) && sAppContext != null) {
-                Object prefs = XposedHelpers.callStaticMethod(userPrefsClass, "getInstance", sAppContext);
+                Object prefs = HookBridge.callStaticMethod(userPrefsClass, "getInstance", sAppContext);
                 if (prefs != null) {
-                    String a7 = (String) XposedHelpers.callMethod(prefs, "A7");
+                    String a7 = callUserPrefsCity(prefs);
                     if (a7 != null && !a7.trim().isEmpty()
                             && !"Hengke Village".equalsIgnoreCase(a7.trim())
                             && !"興隆里".equals(a7.trim())) {
@@ -2142,9 +2292,10 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
 
     private static void saveRealLocationToPrefs(Context ctx, ClassLoader cl, String city, Double lat, Double lon) {
         try {
-            Class<?> userPrefsClass = findClassSafe(cl, "com.mc.miband1.model.UserPreferences");
-            if (userPrefsClass == null) return;
-            SharedPreferences sp = (SharedPreferences) XposedHelpers.callStaticMethod(userPrefsClass, "N6");
+            if (ctx != null && sAppContext == null) {
+                sAppContext = ctx.getApplicationContext();
+            }
+            SharedPreferences sp = getNotifySharedPrefs(cl);
             if (sp != null) {
                 SharedPreferences.Editor ed = sp.edit();
                 if (city != null && !city.isEmpty()) {
@@ -2170,7 +2321,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
             // 1. Hook UpdateFirmwareActivity.p0() -> prevent returning 1 (legacy CEP) on Balance 2 (Zepp OS 6)
             Class<?> updFwClass = findClassSafe(cl, "com.mc.miband1.ui.updateFirmware.UpdateFirmwareActivity");
             if (updFwClass != null && hasMethod(updFwClass, "p0")) {
-                XposedHelpers.findAndHookMethod(updFwClass, "p0", new XC_MethodHook() {
+                HookBridge.findAndHookMethod(updFwClass, "p0", new HookBridge.MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
                         if (!isAgpsFixEnabled(cl)) return;
@@ -2184,10 +2335,13 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                 });
             }
 
-            // 2. Hook Llj4.d(Context, Intent) in UpdateFirmwareActivity so ProgressDialog R updates 0%->100% and dismisses cleanly
-            Class<?> lj4Class = findClassSafe(cl, "lj4");
-            if (lj4Class != null && hasMethod(lj4Class, "d", Context.class, Intent.class)) {
-                XposedHelpers.findAndHookMethod(lj4Class, "d", Context.class, Intent.class, new XC_MethodHook() {
+            // 2. Hook Lmj4.b (v24.1.1) or Llj4.d (v24.0.3) in UpdateFirmwareActivity so ProgressDialog R updates 0%->100% and dismisses cleanly
+            Class<?> fwRecvClass = findClassSafe(cl, "mj4", "lj4");
+            String fwRecvMethod = (fwRecvClass != null && hasMethod(fwRecvClass, "b", Context.class, Intent.class)) ? "b"
+                    : ((fwRecvClass != null && hasMethod(fwRecvClass, "d", Context.class, Intent.class)) ? "d" : null);
+            if (fwRecvClass != null && fwRecvMethod != null) {
+                final String targetFieldName = "mj4".equals(fwRecvClass.getSimpleName()) ? "b" : "c";
+                HookBridge.findAndHookMethod(fwRecvClass, fwRecvMethod, Context.class, Intent.class, new HookBridge.MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
                         if (!isAgpsFixEnabled(cl)) return;
@@ -2195,20 +2349,25 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                             Intent intent = (Intent) param.args[1];
                             if (intent == null) return;
                             String action = intent.getAction();
-                            Object target = XposedHelpers.getObjectField(param.thisObject, "c");
+                            Object target = HookBridge.getObjectField(param.thisObject, targetFieldName);
                             if (target == null || !target.getClass().getName().endsWith("UpdateFirmwareActivity")) {
                                 return;
                             }
-                            android.app.ProgressDialog pd = (android.app.ProgressDialog) XposedHelpers.getObjectField(target, "R");
-                            if ("com.mc.miband.firmware.progress".equals(action)) {
-                                int pct = intent.getIntExtra("52dba2e7-52ff-4cfa-a5ac-e25c554ba544", 0);
+                            android.app.ProgressDialog pd = (android.app.ProgressDialog) HookBridge.getObjectField(target, "R");
+                            if (ACTION_NOTIFY_FW_PROGRESS_UUID.equals(action) || "com.mc.miband.firmware.progress".equals(action)) {
+                                int pct = intent.hasExtra("progress")
+                                        ? intent.getIntExtra("progress", 0)
+                                        : intent.getIntExtra("52dba2e7-52ff-4cfa-a5ac-e25c554ba544", 0);
                                 if (pd != null && pd.isShowing()) {
                                     pd.setIndeterminate(false);
                                     pd.setMax(100);
                                     pd.setProgress(pct);
                                     pd.setMessage("正在透過藍牙傳送 AGPS 星曆至手錶: " + pct + "%");
                                 }
-                            } else if ("com.mc.miband.firmware.done".equals(action) || "com.mc.miband.firmwareKO".equals(action)) {
+                            } else if (ACTION_NOTIFY_FW_DONE_UUID.equals(action)
+                                    || ACTION_NOTIFY_FW_KO_UUID.equals(action)
+                                    || "com.mc.miband.firmware.done".equals(action)
+                                    || "com.mc.miband.firmwareKO".equals(action)) {
                                 if (pd != null && pd.isShowing()) {
                                     pd.dismiss();
                                 }
@@ -2217,12 +2376,16 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                         }
                     }
                 });
+                logInfo("Hooked UpdateFirmwareActivity receiver: " + fwRecvClass.getName() + "." + fwRecvMethod + "(Context, Intent)");
             }
 
-            // 3. Hook Luv.d(Context) -> Fix ZIP extraction of lto7dv5.brm / lto2dv5.brm & pack UIHH (0x8B)
-            final Class<?> uvClass = findClassSafe(cl, "uv");
-            if (uvClass != null && hasMethod(uvClass, "d", Context.class)) {
-                XposedHelpers.findAndHookMethod(uvClass, "d", Context.class, new XC_MethodHook() {
+            // 3. Hook Lsv.c(Context) [v24.1.1] or Luv.d(Context) [v24.0.3] -> Prepare valid Zepp OS 6 UIHH (EPO/LTO)
+            final Class<?> uvClass = findClassSafe(cl, "sv", "uv");
+            String agpsPackMethod = (uvClass != null && hasMethodWithReturn(uvClass, "c", java.io.File.class, Context.class)) ? "c"
+                    : ((uvClass != null && hasMethodWithReturn(uvClass, "d", java.io.File.class, Context.class)) ? "d" : null);
+            if (uvClass != null && agpsPackMethod != null) {
+                final String pm = agpsPackMethod;
+                HookBridge.findAndHookMethod(uvClass, agpsPackMethod, Context.class, new HookBridge.MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         if (!isAgpsFixEnabled(cl)) return;
@@ -2231,30 +2394,32 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                         try {
                             java.io.File uihFile = prepareZeppOs6AgpsUihFile(ctx, cl);
                             if (uihFile != null && uihFile.exists() && uihFile.length() > 32) {
-                                logInfo("[Luv.d] Prepared valid Zepp OS 6 UIHH AGPS file: "
+                                logInfo("[" + uvClass.getSimpleName() + "." + pm + "] Prepared valid Zepp OS 6 UIHH AGPS file: "
                                         + uihFile.getAbsolutePath() + " (" + uihFile.length() + " bytes)");
                                 param.setResult(uihFile);
                             } else {
-                                logError("[Luv.d] prepareZeppOs6AgpsUihFile returned null/empty -> broadcasting firmwareKO to prevent UI hang", null);
+                                logError("[" + uvClass.getSimpleName() + "." + pm + "] prepareZeppOs6AgpsUihFile returned null/empty -> broadcasting firmwareKO to prevent UI hang", null);
                                 broadcastFirmwareKo(ctx, cl);
                                 param.setResult(null);
                             }
                         } catch (Throwable t) {
-                            logError("[Luv.d] Exception in Zepp OS 6 AGPS packer", t);
+                            logError("[" + uvClass.getSimpleName() + "." + pm + "] Exception in Zepp OS 6 AGPS packer", t);
                             broadcastFirmwareKo(ctx, cl);
                             param.setResult(null);
                         }
                     }
                 });
-                logInfo("Hooked Luv.d(Context) for Zepp OS 6 LTO/EPO UIHH packaging");
+                logInfo("Hooked " + uvClass.getName() + "." + agpsPackMethod + "(Context) for Zepp OS 6 LTO/EPO UIHH packaging");
             }
 
-            // 4. Hook Luv.i(BLEManager, File, Ls6) to request HIGH connection priority, log MTU, and track progress
+            // 4. Hook Lsv.h [v24.1.1] or Luv.i [v24.0.3] (BLEManager, File, Ls6) to request HIGH connection priority, log MTU, and track progress
             Class<?> bleMgrClass = findClassSafe(cl, "com.mc.miband1.bluetooth.BLEManager");
             Class<?> s6Class = findClassSafe(cl, "s6");
-            if (uvClass != null && bleMgrClass != null && s6Class != null
-                    && hasMethod(uvClass, "i", bleMgrClass, java.io.File.class, s6Class)) {
-                XposedHelpers.findAndHookMethod(uvClass, "i", bleMgrClass, java.io.File.class, s6Class, new XC_MethodHook() {
+            String agpsSendMethod = (uvClass != null && bleMgrClass != null && s6Class != null && hasMethod(uvClass, "h", bleMgrClass, java.io.File.class, s6Class)) ? "h"
+                    : ((uvClass != null && bleMgrClass != null && s6Class != null && hasMethod(uvClass, "i", bleMgrClass, java.io.File.class, s6Class)) ? "i" : null);
+            if (uvClass != null && agpsSendMethod != null) {
+                final String sm = agpsSendMethod;
+                HookBridge.findAndHookMethod(uvClass, agpsSendMethod, bleMgrClass, java.io.File.class, s6Class, new HookBridge.MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         if (!isAgpsFixEnabled(cl)) return;
@@ -2270,13 +2435,18 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                             int currentMtu = -1;
                             try {
                                 if (bleMgr != null) {
-                                    // Bypass 120s V0 cooldown so CONNECTION_PRIORITY_HIGH (1) activates immediately
-                                    try {
-                                        XposedHelpers.setLongField(bleMgr, "D1", 0L);
-                                    } catch (Throwable ignored) {
+                                    // Bypass 120s S0/V0 cooldown so CONNECTION_PRIORITY_HIGH (1) activates immediately
+                                    for (String cdField : new String[]{"F1", "D1"}) {
+                                        try {
+                                            HookBridge.setLongField(bleMgr, cdField, 0L);
+                                            break;
+                                        } catch (Throwable ignored) {
+                                        }
                                     }
-                                    if (hasMethod(bleMgr.getClass(), "V0", int.class, boolean.class)) {
-                                        XposedHelpers.callMethod(bleMgr, "V0", 1, false);
+                                    if (hasMethod(bleMgr.getClass(), "S0", int.class, boolean.class)) {
+                                        HookBridge.callMethod(bleMgr, "S0", 1, false);
+                                    } else if (hasMethod(bleMgr.getClass(), "V0", int.class, boolean.class)) {
+                                        HookBridge.callMethod(bleMgr, "V0", 1, false);
                                     } else {
                                         android.bluetooth.BluetoothGatt gatt = getBluetoothGattFromBleManager(bleMgr);
                                         if (gatt != null) {
@@ -2284,28 +2454,32 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                                         }
                                     }
                                     try {
-                                        Object lo20 = XposedHelpers.getObjectField(bleMgr, "b");
+                                        Object lo20 = HookBridge.getObjectField(bleMgr, "b");
                                         if (lo20 != null) {
-                                            currentMtu = XposedHelpers.getIntField(lo20, "w");
+                                            currentMtu = HookBridge.getIntField(lo20, "w");
                                         }
                                     } catch (Throwable ignored) {
                                     }
                                 }
                             } catch (Throwable t) {
-                                logError("[Luv.i] Failed to boost BLE connection priority", t);
+                                logError("[" + uvClass.getSimpleName() + "." + sm + "] Failed to boost BLE connection priority", t);
                             }
-                            logInfo("[Luv.i] Starting BLE AGPS transfer (agps://upgrade): size=" + sCurrentAgpsTotalBytes
+                            logInfo("[" + uvClass.getSimpleName() + "." + sm + "] Starting BLE AGPS transfer (agps://upgrade): size=" + sCurrentAgpsTotalBytes
                                     + " bytes, mtu=" + currentMtu + ", connPriority=HIGH");
                             notifyAgpsProgress(sAppContext, cl, 1, "🛰️ 正在透過藍牙高速傳送 AGPS 星曆至手錶: 1% (0/" + (sCurrentAgpsTotalBytes / 1024) + " KB)", false, true);
                         }
                     }
                 });
+                logInfo("Hooked " + uvClass.getName() + "." + agpsSendMethod + "(BLEManager, File, Ls6) for fast AGPS transfer");
             }
 
-            // 4b. CRITICAL FIX: Hook BLEManager.C1(BluetoothGattCharacteristic, byte[], int) -> use mode=2 (v7=1, v4=0 -> NO 600ms sleep!),
-            // force WRITE_TYPE_NO_RESPONSE when characteristic supports PROPERTY_WRITE_NO_RESPONSE, and protect Lqn7 timeout from 40ms flake.
-            if (bleMgrClass != null && hasMethod(bleMgrClass, "C1", android.bluetooth.BluetoothGattCharacteristic.class, byte[].class, int.class)) {
-                XposedHelpers.findAndHookMethod(bleMgrClass, "C1", android.bluetooth.BluetoothGattCharacteristic.class, byte[].class, int.class, new XC_MethodHook() {
+            // 4b. CRITICAL FIX: Hook BLEManager.x1 [v24.1.1] / C1 [v24.0.3] (BluetoothGattCharacteristic, byte[], int) -> use mode=2 (NO 600ms sleep!),
+            // force WRITE_TYPE_NO_RESPONSE when characteristic supports PROPERTY_WRITE_NO_RESPONSE, and protect Lvn7/Lqn7 timeout from 40ms flake.
+            String bleWriteMethod = (bleMgrClass != null && hasMethod(bleMgrClass, "x1", android.bluetooth.BluetoothGattCharacteristic.class, byte[].class, int.class)) ? "x1"
+                    : ((bleMgrClass != null && hasMethod(bleMgrClass, "C1", android.bluetooth.BluetoothGattCharacteristic.class, byte[].class, int.class)) ? "C1" : null);
+            if (bleMgrClass != null && bleWriteMethod != null) {
+                final String wm = bleWriteMethod;
+                HookBridge.findAndHookMethod(bleMgrClass, bleWriteMethod, android.bluetooth.BluetoothGattCharacteristic.class, byte[].class, int.class, new HookBridge.MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         if (!isAgpsFixEnabled(cl)) return;
@@ -2322,12 +2496,12 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                                         ch.setWriteType(android.bluetooth.BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE);
                                     }
                                     if (origMode == 0 || origMode == 1) {
-                                        // Mode 2 sets v7=1 and v4=0 in BLEManager.C1, bypassing BOTH J1 lock and Thread.sleep(600) per packet!
+                                        // Mode 2 bypasses BOTH ReentrantLock and Thread.sleep(600) per packet!
                                         param.args[2] = 2;
                                     }
                                     if (!sLoggedAgpsBleParams) {
                                         sLoggedAgpsBleParams = true;
-                                        logInfo("[BLEManager.C1] Fast BLE config uuid=" + u
+                                        logInfo("[BLEManager." + wm + "] Fast BLE config uuid=" + u
                                                 + ", props=0x" + Integer.toHexString(props)
                                                 + ", writeType=" + ch.getWriteType()
                                                 + ", origMode=" + origMode + " -> forcedMode=" + param.args[2]);
@@ -2338,13 +2512,13 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                         }
                     }
                 });
-                logInfo("Hooked BLEManager.C1 to use mode=2 (zero 600ms sleep) + WRITE_TYPE_NO_RESPONSE on Zepp OS 6 file transfer characteristics");
+                logInfo("Hooked BLEManager." + bleWriteMethod + " to use mode=2 (zero 600ms sleep) + WRITE_TYPE_NO_RESPONSE on Zepp OS 6 file transfer characteristics");
             }
 
-            // 4b-2. Hook Lqn7.l(long) so mode=2's 40ms ConditionVariable timeout won't abort under brief BLE jitter
-            Class<?> qn7Class = findClassSafe(cl, "qn7");
+            // 4b-2. Hook Lvn7.l(long) [v24.1.1] / Lqn7.l(long) [v24.0.3] so mode=2's 40ms ConditionVariable timeout won't abort under brief BLE jitter
+            Class<?> qn7Class = findClassSafe(cl, "vn7", "qn7");
             if (qn7Class != null && hasMethod(qn7Class, "l", long.class)) {
-                XposedHelpers.findAndHookMethod(qn7Class, "l", long.class, new XC_MethodHook() {
+                HookBridge.findAndHookMethod(qn7Class, "l", long.class, new HookBridge.MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         if (!isAgpsFixEnabled(cl) || !sAgpsTransferActive) return;
@@ -2354,25 +2528,42 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                         }
                     }
                 });
-                logInfo("Hooked Lqn7.l(long) to relax 40ms fast-write timeout to 3000ms safety ceiling");
+                logInfo("Hooked " + qn7Class.getName() + ".l(long) to relax 40ms fast-write timeout to 3000ms safety ceiling");
             }
 
             // 4c. Hook Lou8.j(), Lou8.c(UUID, byte[]), and Lmu8.run() to prevent Main Thread monitor contention and premature 5s chunk timeout
             Class<?> ou8Class = findClassSafe(cl, "ou8");
+            // v24.1.1 Lou8: active transfer = field g (Lp22), last timestamp = field i (long)
+            // v24.0.3 Lou8: active transfer = field h (Lu22), last timestamp = field j (long)
+            String resolvedTsField = "j";
+            String resolvedTransferField = "h";
+            if (ou8Class != null) {
+                try {
+                    Field fI = ou8Class.getDeclaredField("i");
+                    if (fI.getType() == long.class) {
+                        resolvedTsField = "i";
+                        resolvedTransferField = "g";
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+            final String ou8TsField = resolvedTsField;
+            final String ou8TransferField = resolvedTransferField;
+
             if (ou8Class != null) {
                 if (hasMethod(ou8Class, "j")) {
-                    XposedHelpers.findAndHookMethod(ou8Class, "j", new XC_MethodHook() {
+                    HookBridge.findAndHookMethod(ou8Class, "j", new HookBridge.MethodHook() {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
                             try {
-                                XposedHelpers.setLongField(param.thisObject, "j", System.currentTimeMillis());
+                                HookBridge.setLongField(param.thisObject, ou8TsField, System.currentTimeMillis());
                             } catch (Throwable ignored) {
                             }
                         }
                     });
                 }
                 if (hasMethod(ou8Class, "c", java.util.UUID.class, byte[].class)) {
-                    XposedHelpers.findAndHookMethod(ou8Class, "c", java.util.UUID.class, byte[].class, new XC_MethodHook() {
+                    HookBridge.findAndHookMethod(ou8Class, "c", java.util.UUID.class, byte[].class, new HookBridge.MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
                             try {
@@ -2390,23 +2581,23 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
             }
             Class<?> mu8Class = findClassSafe(cl, "mu8");
             if (mu8Class != null && hasMethod(mu8Class, "run")) {
-                XposedHelpers.findAndHookMethod(mu8Class, "run", new XC_MethodHook() {
+                HookBridge.findAndHookMethod(mu8Class, "run", new HookBridge.MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         if (!isAgpsFixEnabled(cl)) return;
                         try {
-                            int f = XposedHelpers.getIntField(param.thisObject, "f");
+                            int f = HookBridge.getIntField(param.thisObject, "f");
                             if (f == 1) {
-                                Object ou8 = XposedHelpers.getObjectField(param.thisObject, "w");
+                                Object ou8 = HookBridge.getObjectField(param.thisObject, "w");
                                 if (ou8 != null) {
-                                    Object u22 = XposedHelpers.getObjectField(ou8, "h");
-                                    long lastJ = XposedHelpers.getLongField(ou8, "j");
+                                    Object activeTransfer = HookBridge.getObjectField(ou8, ou8TransferField);
+                                    long lastJ = HookBridge.getLongField(ou8, ou8TsField);
                                     long elapsed = System.currentTimeMillis() - lastJ;
-                                    if (u22 != null && lastJ > 0L && elapsed < 35000L) {
+                                    if (activeTransfer != null && lastJ > 0L && elapsed < 35000L) {
                                         // Transfer is still active; reschedule timeout without acquiring synchronized(ou8) on Main Thread!
-                                        Object t22 = XposedHelpers.getObjectField(ou8, "a");
+                                        Object t22 = HookBridge.getObjectField(ou8, "a");
                                         if (t22 != null) {
-                                            android.os.Handler h = (android.os.Handler) XposedHelpers.getObjectField(t22, "e");
+                                            android.os.Handler h = (android.os.Handler) HookBridge.getObjectField(t22, "e");
                                             if (h != null) {
                                                 h.postDelayed((Runnable) param.thisObject, 5000L);
                                                 param.setResult(null);
@@ -2425,12 +2616,12 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
             Class<?> ku8Class = findClassSafe(cl, "ku8");
             if (ku8Class != null) {
                 if (hasMethod(ku8Class, "q", int.class)) {
-                    XposedHelpers.findAndHookMethod(ku8Class, "q", int.class, new XC_MethodHook() {
+                    HookBridge.findAndHookMethod(ku8Class, "q", int.class, new HookBridge.MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
                             if (!isAgpsFixEnabled(cl)) return;
                             try {
-                                int mode = XposedHelpers.getIntField(param.thisObject, "f");
+                                int mode = HookBridge.getIntField(param.thisObject, "f");
                                 if (mode != 3 && !sAgpsTransferActive) return;
                                 int bytesSent = (Integer) param.args[0];
                                 int total = sCurrentAgpsTotalBytes > 0 ? sCurrentAgpsTotalBytes : 318066;
@@ -2450,19 +2641,19 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                 }
 
                 if (hasMethod(ku8Class, "l", boolean.class)) {
-                    XposedHelpers.findAndHookMethod(ku8Class, "l", boolean.class, new XC_MethodHook() {
+                    HookBridge.findAndHookMethod(ku8Class, "l", boolean.class, new HookBridge.MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
                             if (!isAgpsFixEnabled(cl)) return;
                             try {
-                                int mode = XposedHelpers.getIntField(param.thisObject, "f");
+                                int mode = HookBridge.getIntField(param.thisObject, "f");
                                 if (mode != 3) return;
                                 boolean success = (Boolean) param.args[0];
                                 sAgpsTransferActive = false;
                                 Object s6Candidate = null;
                                 for (String fn : new String[]{"i", "g", "q", "w"}) {
                                     try {
-                                        Object val = XposedHelpers.getObjectField(param.thisObject, fn);
+                                        Object val = HookBridge.getObjectField(param.thisObject, fn);
                                         if (val != null && s6Class != null && s6Class.isInstance(val)) {
                                             s6Candidate = val;
                                             break;
@@ -2484,9 +2675,9 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                                     notifyAgpsProgress(sAppContext, cl, 0, "❌ AGPS 藍牙傳輸失敗，請確認手錶連線穩定後重試", true, false);
                                     broadcastFirmwareKo(sAppContext, cl);
                                     if (s6Obj != null) {
-                                        Object bm7 = XposedHelpers.getObjectField(s6Obj, "d");
+                                        Object bm7 = HookBridge.getObjectField(s6Obj, "d");
                                         if (bm7 != null) {
-                                            XposedHelpers.callMethod(bm7, "e", false);
+                                            HookBridge.callMethod(bm7, "e", false);
                                         }
                                     }
                                     param.setResult(null);
@@ -2517,9 +2708,9 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                                                 + "ms, sinceProgress=" + sinceProgress + "ms) -> querying 0x0A and triggering fallback completion");
                                         recordAgpsUpdateSuccess(sAppContext, cl);
                                         if (s6Obj != null) {
-                                            Object bm7 = XposedHelpers.getObjectField(s6Obj, "d");
+                                            Object bm7 = HookBridge.getObjectField(s6Obj, "d");
                                             if (bm7 != null) {
-                                                XposedHelpers.callMethod(bm7, "e", true);
+                                                HookBridge.callMethod(bm7, "e", true);
                                             }
                                         }
                                         queryWatchAgpsConfigOnEndpoint0A(cl);
@@ -2540,7 +2731,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
             // 6. Hook Ls6.f(Lxp, int, byte[]) on Endpoint 0x42 to observe watch AGPS install status
             Class<?> xpClass = findClassSafe(cl, "xp");
             if (s6Class != null && xpClass != null && hasMethod(s6Class, "f", xpClass, int.class, byte[].class)) {
-                XposedHelpers.findAndHookMethod(s6Class, "f", xpClass, int.class, byte[].class, new XC_MethodHook() {
+                HookBridge.findAndHookMethod(s6Class, "f", xpClass, int.class, byte[].class, new HookBridge.MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         if (!isAgpsFixEnabled(cl)) return;
@@ -2586,22 +2777,23 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                 });
             }
 
-            // 7. Hook Lxm6.f(Lxp, int, byte[]) on Endpoint 0x0a to parse watch AGPS status response
-            Class<?> xm6Class = findClassSafe(cl, "xm6");
+            // 7. Hook Lbn6.f [v24.1.1] / Lxm6.f [v24.0.3] (Lxp, int, byte[]) on Endpoint 0x0a to parse watch AGPS status response
+            Class<?> xm6Class = findClassSafe(cl, "bn6", "xm6");
             if (xm6Class != null && xpClass != null && hasMethod(xm6Class, "f", xpClass, int.class, byte[].class)) {
-                XposedHelpers.findAndHookMethod(xm6Class, "f", xpClass, int.class, byte[].class, new XC_MethodHook() {
+                HookBridge.findAndHookMethod(xm6Class, "f", xpClass, int.class, byte[].class, new HookBridge.MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         try {
                             byte[] data = (byte[]) param.args[2];
                             if (data != null && data.length >= 4 && data[0] == 0x04 && data[1] == 0x01 && data[2] == 0x00) {
-                                logInfo("[Lxm6.f] Endpoint 0x0A AGPS Config Response (group=0x00): " + bytesToHex(data));
+                                logInfo("[" + xm6Class.getSimpleName() + ".f] Endpoint 0x0A AGPS Config Response (group=0x00): " + bytesToHex(data));
                                 parseWatchEndpoint0AAgpsTimestamps(data, cl);
                             }
                         } catch (Throwable ignored) {
                         }
                     }
                 });
+                logInfo("Hooked Endpoint 0x0A AGPS config handler: " + xm6Class.getName() + ".f");
             }
         } catch (Throwable t) {
             logError("hookAgpsFixPipeline failed", t);
@@ -2684,11 +2876,16 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
         if (ctx == null) ctx = sAppContext;
         if (ctx == null) return;
         try {
+            Class<?> v38Class = findClassSafe(cl, "v38");
+            if (v38Class != null && hasMethod(v38Class, "h2", Context.class, String.class)) {
+                HookBridge.callStaticMethod(v38Class, "h2", ctx.getApplicationContext(), ACTION_NOTIFY_FW_KO_UUID);
+                return;
+            }
             Class<?> w38Class = findClassSafe(cl, "w38", "e48", "b48");
             if (w38Class != null && hasMethod(w38Class, "s2", Context.class, String.class)) {
-                XposedHelpers.callStaticMethod(w38Class, "s2", ctx.getApplicationContext(), "com.mc.miband.firmwareKO");
+                HookBridge.callStaticMethod(w38Class, "s2", ctx.getApplicationContext(), "com.mc.miband.firmwareKO");
             } else {
-                Intent ko = new Intent("com.mc.miband.firmwareKO");
+                Intent ko = new Intent(ACTION_NOTIFY_FW_KO_UUID);
                 ko.setPackage(TARGET_PACKAGE);
                 ctx.sendBroadcast(ko);
             }
@@ -2702,12 +2899,20 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
         try {
             // 1. Broadcast Notify's native progress intent so UpdateFirmwareActivity updates
             if (!done && pct >= 0) {
-                Class<?> w38Class = findClassSafe(cl, "w38", "e48", "b48");
-                if (w38Class != null && hasMethod(w38Class, "r0", String.class)
-                        && hasMethod(w38Class, "r2", Context.class, Intent.class)) {
-                    Intent progIntent = (Intent) XposedHelpers.callStaticMethod(w38Class, "r0", "com.mc.miband.firmware.progress");
-                    progIntent.putExtra("52dba2e7-52ff-4cfa-a5ac-e25c554ba544", pct);
-                    XposedHelpers.callStaticMethod(w38Class, "r2", ctx.getApplicationContext(), progIntent);
+                Class<?> v38Class = findClassSafe(cl, "v38");
+                if (v38Class != null && hasMethod(v38Class, "k0", String.class)
+                        && hasMethod(v38Class, "g2", Context.class, Intent.class)) {
+                    Intent progIntent = (Intent) HookBridge.callStaticMethod(v38Class, "k0", ACTION_NOTIFY_FW_PROGRESS_UUID);
+                    progIntent.putExtra("progress", pct);
+                    HookBridge.callStaticMethod(v38Class, "g2", ctx.getApplicationContext(), progIntent);
+                } else {
+                    Class<?> w38Class = findClassSafe(cl, "w38", "e48", "b48");
+                    if (w38Class != null && hasMethod(w38Class, "r0", String.class)
+                            && hasMethod(w38Class, "r2", Context.class, Intent.class)) {
+                        Intent progIntent = (Intent) HookBridge.callStaticMethod(w38Class, "r0", "com.mc.miband.firmware.progress");
+                        progIntent.putExtra("52dba2e7-52ff-4cfa-a5ac-e25c554ba544", pct);
+                        HookBridge.callStaticMethod(w38Class, "r2", ctx.getApplicationContext(), progIntent);
+                    }
                 }
             }
             // 2. Broadcast internal progress to Notify UI process (BandSettingsActivity)
@@ -2737,12 +2942,12 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
 
         saveModuleConfigToNotifyPrefs(cl);
 
-        // Also update Notify's own Lux7 AGPS timestamp key ("22d907dc-6606-4aac-ba8d-d6219402818e")
+        // Also update Notify's own Lyx7/Lux7 AGPS timestamp key ("22d907dc-6606-4aac-ba8d-d6219402818e")
         if (ctx != null && cl != null) {
             try {
-                Class<?> ux7Class = findClassSafe(cl, "ux7");
+                Class<?> ux7Class = findClassSafe(cl, "yx7", "ux7");
                 if (ux7Class != null && hasMethod(ux7Class, "j", Context.class, String.class, long.class)) {
-                    XposedHelpers.callStaticMethod(ux7Class, "j", ctx.getApplicationContext(), NOTIFY_AGPS_TIME_KEY, now);
+                    HookBridge.callStaticMethod(ux7Class, "j", ctx.getApplicationContext(), NOTIFY_AGPS_TIME_KEY, now);
                 }
             } catch (Throwable ignored) {
             }
@@ -2759,7 +2964,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
         try {
             Class<?> bleMgrClass = findClassSafe(cl, "com.mc.miband1.bluetooth.BLEManager");
             if (bleMgrClass == null) return null;
-            for (String candidate : new String[]{"U1", "S1", "T1", "R1"}) {
+            for (String candidate : new String[]{"W1", "U1", "S1", "T1", "R1"}) {
                 try {
                     Field f = bleMgrClass.getDeclaredField(candidate);
                     if (java.lang.reflect.Modifier.isStatic(f.getModifiers()) && f.getType() == bleMgrClass) {
@@ -2786,7 +2991,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
         if (bleMgr == null) return null;
         try {
             Class<?> c = bleMgr.getClass();
-            for (String candidate : new String[]{"Q1", "O1", "P1", "R1"}) {
+            for (String candidate : new String[]{"S1", "Q1", "O1", "P1", "R1"}) {
                 try {
                     Field f = c.getDeclaredField(candidate);
                     if (!java.lang.reflect.Modifier.isStatic(f.getModifiers())
@@ -2814,14 +3019,14 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
     private static void queryWatchAgpsConfigOnEndpoint0A(ClassLoader cl) {
         try {
             Class<?> bleMgrClass = findClassSafe(cl, "com.mc.miband1.bluetooth.BLEManager");
-            Class<?> xm6Class = findClassSafe(cl, "xm6");
-            Class<?> nv0Class = findClassSafe(cl, "nv0");
+            Class<?> xm6Class = findClassSafe(cl, "bn6", "xm6");
+            Class<?> nv0Class = findClassSafe(cl, "mv0", "nv0");
             if (bleMgrClass != null && xm6Class != null && nv0Class != null) {
                 Object bleMgr = getBleManagerInstance(cl);
-                Object nv0Agps = XposedHelpers.getStaticObjectField(nv0Class, "q");
+                Object nv0Agps = HookBridge.getStaticObjectField(nv0Class, "q");
                 if (bleMgr != null && nv0Agps != null && hasMethod(xm6Class, "k", bleMgrClass, nv0Class)) {
-                    XposedHelpers.callStaticMethod(xm6Class, "k", bleMgr, nv0Agps);
-                    logInfo("[AGPS] Queried watch Endpoint 0x0A for AGPS config group (Lnv0.q)");
+                    HookBridge.callStaticMethod(xm6Class, "k", bleMgr, nv0Agps);
+                    logInfo("[AGPS] Queried watch Endpoint 0x0A for AGPS config group (" + xm6Class.getSimpleName() + ".k / " + nv0Class.getSimpleName() + ".q)");
                 }
             }
         } catch (Throwable t) {
@@ -3031,7 +3236,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
             byte tag = entry.getKey();
             byte[] payload = entry.getValue();
             int crc = (qn0Class != null)
-                    ? (Integer) XposedHelpers.callStaticMethod(qn0Class, "c", (Object) payload)
+                    ? (Integer) HookBridge.callStaticMethod(qn0Class, "c", (Object) payload)
                     : 0;
             java.nio.ByteBuffer itemHeader = java.nio.ByteBuffer.allocate(10).order(java.nio.ByteOrder.LITTLE_ENDIAN);
             itemHeader.put((byte) 0x01);
@@ -3043,7 +3248,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
         }
         byte[] bodyBytes = bodyStream.toByteArray();
         int bodyCrc = (qn0Class != null)
-                ? (Integer) XposedHelpers.callStaticMethod(qn0Class, "c", (Object) bodyBytes)
+                ? (Integer) HookBridge.callStaticMethod(qn0Class, "c", (Object) bodyBytes)
                 : 0;
 
         java.nio.ByteBuffer header = java.nio.ByteBuffer.allocate(32).order(java.nio.ByteOrder.LITTLE_ENDIAN);
@@ -3119,24 +3324,34 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
 
             Class<?> genericFpClass = findClassSafe(cl, "com.mc.miband1.GenericFileProvider");
             android.net.Uri fileUri = (genericFpClass != null && hasMethod(genericFpClass, "c", Context.class, java.io.File.class))
-                    ? (android.net.Uri) XposedHelpers.callStaticMethod(genericFpClass, "c", ctx.getApplicationContext(), uihFile)
+                    ? (android.net.Uri) HookBridge.callStaticMethod(genericFpClass, "c", ctx.getApplicationContext(), uihFile)
                     : android.net.Uri.fromFile(uihFile);
 
-            Class<?> w38Class = findClassSafe(cl, "w38", "e48", "b48");
-            if (w38Class != null && hasMethod(w38Class, "r0", String.class)
-                    && hasMethod(w38Class, "r2", Context.class, Intent.class)) {
-                Intent agpsIntent = (Intent) XposedHelpers.callStaticMethod(w38Class, "r0", "com.mc.miband.doAgpsUpdate");
+            Class<?> v38Class = findClassSafe(cl, "v38");
+            if (v38Class != null && hasMethod(v38Class, "k0", String.class)
+                    && hasMethod(v38Class, "g2", Context.class, Intent.class)) {
+                Intent agpsIntent = (Intent) HookBridge.callStaticMethod(v38Class, "k0", ACTION_NOTIFY_DO_AGPS_UUID);
                 agpsIntent.putExtra("firmwareFile", fileUri);
                 agpsIntent.putExtra("4436627f-408a-43f1-a12b-983c5b501c01", (mode == 2) ? 2 : 3);
-                XposedHelpers.callStaticMethod(w38Class, "r2", ctx.getApplicationContext(), agpsIntent);
-                logInfo("[OneClickAGPS] Dispatched com.mc.miband.doAgpsUpdate via " + w38Class.getName() + ".r2 (uri=" + fileUri + ")");
+                HookBridge.callStaticMethod(v38Class, "g2", ctx.getApplicationContext(), agpsIntent);
+                logInfo("[OneClickAGPS] Dispatched AGPS update UUID via v38.g2 (uri=" + fileUri + ")");
             } else {
-                Intent fallback = new Intent("com.mc.miband.doAgpsUpdate");
-                fallback.setPackage(TARGET_PACKAGE);
-                fallback.putExtra("firmwareFile", fileUri);
-                fallback.putExtra("4436627f-408a-43f1-a12b-983c5b501c01", (mode == 2) ? 2 : 3);
-                ctx.sendBroadcast(fallback);
-                logInfo("[OneClickAGPS] Dispatched com.mc.miband.doAgpsUpdate via standard broadcast");
+                Class<?> w38Class = findClassSafe(cl, "w38", "e48", "b48");
+                if (w38Class != null && hasMethod(w38Class, "r0", String.class)
+                        && hasMethod(w38Class, "r2", Context.class, Intent.class)) {
+                    Intent agpsIntent = (Intent) HookBridge.callStaticMethod(w38Class, "r0", "com.mc.miband.doAgpsUpdate");
+                    agpsIntent.putExtra("firmwareFile", fileUri);
+                    agpsIntent.putExtra("4436627f-408a-43f1-a12b-983c5b501c01", (mode == 2) ? 2 : 3);
+                    HookBridge.callStaticMethod(w38Class, "r2", ctx.getApplicationContext(), agpsIntent);
+                    logInfo("[OneClickAGPS] Dispatched com.mc.miband.doAgpsUpdate via " + w38Class.getName() + ".r2 (uri=" + fileUri + ")");
+                } else {
+                    Intent fallback = new Intent(ACTION_NOTIFY_DO_AGPS_UUID);
+                    fallback.setPackage(TARGET_PACKAGE);
+                    fallback.putExtra("firmwareFile", fileUri);
+                    fallback.putExtra("4436627f-408a-43f1-a12b-983c5b501c01", (mode == 2) ? 2 : 3);
+                    ctx.sendBroadcast(fallback);
+                    logInfo("[OneClickAGPS] Dispatched AGPS update UUID via standard broadcast");
+                }
             }
         } catch (Throwable t) {
             logError("[OneClickAGPS] Failed to download/start AGPS update", t);
@@ -3169,7 +3384,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                 return;
             }
 
-            XposedHelpers.findAndHookMethod(bandSettingsClass, "onCreate", android.os.Bundle.class, new XC_MethodHook() {
+            HookBridge.findAndHookMethod(bandSettingsClass, "onCreate", android.os.Bundle.class, new HookBridge.MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
                     try {
@@ -3189,7 +3404,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
             });
 
             if (hasMethod(bandSettingsClass, "onResume")) {
-                XposedHelpers.findAndHookMethod(bandSettingsClass, "onResume", new XC_MethodHook() {
+                HookBridge.findAndHookMethod(bandSettingsClass, "onResume", new HookBridge.MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
                         try {
@@ -3211,7 +3426,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                     }
                 });
             } else {
-                XposedHelpers.findAndHookMethod(android.app.Activity.class, "onResume", new XC_MethodHook() {
+                HookBridge.findAndHookMethod(android.app.Activity.class, "onResume", new HookBridge.MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
                         if (param.thisObject != null && param.thisObject.getClass() == bandSettingsClass) {
@@ -3311,8 +3526,25 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
         }
     }
 
+    private static android.view.View findViewByResNameOrFallback(android.app.Activity activity, String resName, int... fallbackIds) {
+        if (activity == null) return null;
+        try {
+            int id = activity.getResources().getIdentifier(resName, "id", activity.getPackageName());
+            if (id != 0) {
+                android.view.View v = activity.findViewById(id);
+                if (v != null) return v;
+            }
+        } catch (Throwable ignored) {
+        }
+        for (int fid : fallbackIds) {
+            android.view.View v = activity.findViewById(fid);
+            if (v != null) return v;
+        }
+        return null;
+    }
+
     private static void injectAgpsSettingRow(final android.app.Activity activity, final ClassLoader cl) {
-        android.view.View weatherRow = activity.findViewById(0x7f0a0d94);
+        android.view.View weatherRow = findViewByResNameOrFallback(activity, "relativeWeather", 0x7f0a0da0, 0x7f0a0d94);
         android.view.ViewGroup parentGroup = null;
         int insertIndex = 0;
 
@@ -3340,7 +3572,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
 
         int titleColor = 0xFFFFFFFF;
         int subColor = 0xFFB0BEC5;
-        android.view.View existingSub = activity.findViewById(0x7f0a1514);
+        android.view.View existingSub = findViewByResNameOrFallback(activity, "textViewWeatherHint", 0x7f0a1535, 0x7f0a1514);
         if (existingSub instanceof android.widget.TextView) {
             subColor = ((android.widget.TextView) existingSub).getCurrentTextColor();
         }
@@ -3525,8 +3757,8 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
     }
 
     private static void injectUnlockSettingRow(final android.app.Activity activity, final ClassLoader cl) {
-        // 0x7f0a0d94 is the top Weather setting row in BandSettingsActivity
-        android.view.View weatherRow = activity.findViewById(0x7f0a0d94);
+        // id/relativeWeather is the top Weather setting row in BandSettingsActivity (0x7f0a0da0 in v24.1.1, 0x7f0a0d94 in v24.0.3)
+        android.view.View weatherRow = findViewByResNameOrFallback(activity, "relativeWeather", 0x7f0a0da0, 0x7f0a0d94);
         android.view.ViewGroup parentGroup = null;
         int insertIndex = 0;
 
@@ -3557,7 +3789,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
         // Extract theme text colors from existing row if possible
         int titleColor = 0xFFFFFFFF;
         int subColor = 0xFFB0BEC5;
-        android.view.View existingSub = activity.findViewById(0x7f0a1514);
+        android.view.View existingSub = findViewByResNameOrFallback(activity, "textViewWeatherHint", 0x7f0a1535, 0x7f0a1514);
         if (existingSub instanceof android.widget.TextView) {
             subColor = ((android.widget.TextView) existingSub).getCurrentTextColor();
         }
@@ -3896,7 +4128,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
             }
             if (dev == null) {
                 try {
-                    dev = (android.bluetooth.BluetoothDevice) XposedHelpers.getObjectField(bleMgr, "C");
+                    dev = (android.bluetooth.BluetoothDevice) HookBridge.getObjectField(bleMgr, "C");
                 } catch (Throwable ignored) {
                 }
             }
@@ -4297,9 +4529,9 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
         try {
             Class<?> userPrefsClass = findClassSafe(cl, "com.mc.miband1.model.UserPreferences");
             if (userPrefsClass != null && ctx != null) {
-                Object prefs = XposedHelpers.callStaticMethod(userPrefsClass, "getInstance", ctx.getApplicationContext());
+                Object prefs = HookBridge.callStaticMethod(userPrefsClass, "getInstance", ctx.getApplicationContext());
                 if (prefs != null) {
-                    String mac = (String) XposedHelpers.getObjectField(prefs, "miBandMAC");
+                    String mac = (String) HookBridge.getObjectField(prefs, "miBandMAC");
                     if (mac != null && !mac.trim().isEmpty()) {
                         return mac.trim();
                     }
@@ -4314,9 +4546,9 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
         try {
             Class<?> userPrefsClass = findClassSafe(cl, "com.mc.miband1.model.UserPreferences");
             if (userPrefsClass != null && ctx != null) {
-                Object prefs = XposedHelpers.callStaticMethod(userPrefsClass, "getInstance", ctx.getApplicationContext());
+                Object prefs = HookBridge.callStaticMethod(userPrefsClass, "getInstance", ctx.getApplicationContext());
                 if (prefs != null) {
-                    String name = (String) XposedHelpers.getObjectField(prefs, "miBandName");
+                    String name = (String) HookBridge.getObjectField(prefs, "miBandName");
                     if (name != null && !name.trim().isEmpty()) {
                         return name.trim();
                     }
@@ -4330,8 +4562,21 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
     private static SharedPreferences getNotifySharedPrefs(ClassLoader cl) {
         try {
             Class<?> userPrefsClass = findClassSafe(cl, "com.mc.miband1.model.UserPreferences");
-            if (userPrefsClass != null) {
-                return (SharedPreferences) XposedHelpers.callStaticMethod(userPrefsClass, "N6");
+            if (userPrefsClass != null && hasMethodWithReturn(userPrefsClass, "N6", SharedPreferences.class)) {
+                Object res = HookBridge.callStaticMethod(userPrefsClass, "N6");
+                if (res instanceof SharedPreferences) {
+                    return (SharedPreferences) res;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            Context ctx = sAppContext;
+            if (ctx == null && sCurrentBandSettingsActivity != null) {
+                ctx = sCurrentBandSettingsActivity.get();
+            }
+            if (ctx != null) {
+                return ctx.getApplicationContext().getSharedPreferences("preferences", Context.MODE_PRIVATE);
             }
         } catch (Throwable ignored) {
         }
@@ -4482,15 +4727,65 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
         return false;
     }
 
+    private static volatile String sNs50InstanceField = "w0";
+    private static volatile String sNs50DeclineField = "T";
+    private static volatile String sNs50AnswerField = "U";
+
+    private static void resolveNotificationService50Fields(Class<?> ns50Class) {
+        if (ns50Class == null) return;
+        try {
+            for (String cand : new String[]{"w0", "z0"}) {
+                try {
+                    Field f = ns50Class.getDeclaredField(cand);
+                    if (java.lang.reflect.Modifier.isStatic(f.getModifiers()) && f.getType() == ns50Class) {
+                        sNs50InstanceField = cand;
+                        break;
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+            // v24.1.1: T=Decline, U=Answer; v24.0.3: W=Decline, X=Answer
+            try {
+                Field fT = ns50Class.getDeclaredField("T");
+                Field fU = ns50Class.getDeclaredField("U");
+                if (fT.getType() == android.app.PendingIntent.class && fU.getType() == android.app.PendingIntent.class) {
+                    sNs50DeclineField = "T";
+                    sNs50AnswerField = "U";
+                    return;
+                }
+            } catch (Throwable ignored) {
+            }
+            try {
+                Field fW = ns50Class.getDeclaredField("W");
+                Field fX = ns50Class.getDeclaredField("X");
+                if (fW.getType() == android.app.PendingIntent.class && fX.getType() == android.app.PendingIntent.class) {
+                    sNs50DeclineField = "W";
+                    sNs50AnswerField = "X";
+                }
+            } catch (Throwable ignored) {
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
     private void hookVoipCallPipeline(final ClassLoader cl) {
         try {
-            // 10.1 Hook com.mc.miband1.model.d.t6() (isVoipCall)
+            Class<?> ns50Class = findClassSafe(cl, "com.mc.miband1.NotificationService50");
+            resolveNotificationService50Fields(ns50Class);
+            Class<?> yf0Class = findClassSafe(cl, "zf0", "yf0");
+            Class<?> ba8Class = findClassSafe(cl, "ba8");
+            boolean isV2411Voip = (yf0Class != null && "zf0".equals(yf0Class.getSimpleName()))
+                    || (ba8Class != null && ns50Class != null && hasMethod(ba8Class, "f", ns50Class, android.service.notification.StatusBarNotification.class));
+
+            // 10.1 Hook com.mc.miband1.model.d.s6() [v24.1.1] or t6() [v24.0.3] (isVoipCall)
             // Prevent Le64.run() from entering Ltb.o() ("deviceSpeaker notification mode incoming call")
-            // which spams 20 generic app notifications + Ls56 cancel packets over 44s, and allow Lqy.run()
+            // which spams 20 generic app notifications + cancel packets over 44s, and allow Lqy.run()
             // to properly stop the ZeppOS Endpoint 0x1E call alert when the VoIP call ends/answers.
             Class<?> callModelClass = findClassSafe(cl, "com.mc.miband1.model.d");
-            if (callModelClass != null && hasMethod(callModelClass, "t6")) {
-                XposedHelpers.findAndHookMethod(callModelClass, "t6", new XC_MethodHook() {
+            String voipGetterMethod = isV2411Voip ? "s6" : "t6";
+            if (callModelClass != null && hasMethodWithReturn(callModelClass, voipGetterMethod, boolean.class)) {
+                final String vm = voipGetterMethod;
+                HookBridge.findAndHookMethod(callModelClass, voipGetterMethod, new HookBridge.MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
                         if (!isVoipCallFixEnabled(cl)) return;
@@ -4500,7 +4795,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                             for (StackTraceElement el : stack) {
                                 String cn = el.getClassName();
                                 if ("e64".equals(cn) || "qy".equals(cn)) {
-                                    logInfo("[VoipFix] Suppressing d.t6() (voipCall=true -> false) in " + cn
+                                    logInfo("[VoipFix] Suppressing d." + vm + "() (voipCall=true -> false) in " + cn
                                             + " to use clean ZeppOS Endpoint 0x1E native call alert without 20x notification spam");
                                     param.setResult(false);
                                     return;
@@ -4509,12 +4804,12 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                         }
                     }
                 });
+                logInfo("[VoipFix] Hooked com.mc.miband1.model.d." + voipGetterMethod + "()");
             }
 
-            // 10.2 Hook Lyf0.t(Context, String, String) - VoIP incoming call trigger in Notify
-            Class<?> yf0Class = findClassSafe(cl, "yf0");
+            // 10.2 Hook Lzf0.t / Lyf0.t (Context, String, String) - VoIP incoming call trigger in Notify
             if (yf0Class != null && hasMethod(yf0Class, "t", Context.class, String.class, String.class)) {
-                XposedHelpers.findAndHookMethod(yf0Class, "t", Context.class, String.class, String.class, new XC_MethodHook() {
+                HookBridge.findAndHookMethod(yf0Class, "t", Context.class, String.class, String.class, new HookBridge.MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         if (!isVoipCallFixEnabled(cl)) return;
@@ -4533,20 +4828,19 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                             registerVoipAudioAndHfpMonitorIfNeeded(ctx.getApplicationContext(), cl);
                             ensureBluetoothHeadsetProxy(ctx.getApplicationContext());
                         }
-                        logInfo("[VoipFix] Incoming VoIP call detected via Lyf0.t: pkg=" + pkg + ", caller=" + caller
+                        logInfo("[VoipFix] Incoming VoIP call detected via " + yf0Class.getSimpleName() + ".t: pkg=" + pkg + ", caller=" + caller
                                 + ", otherBtHeadsetConnected=" + hasOtherConnectedBluetoothHeadset(ctx, cl));
                     }
                 });
             }
 
-            // 10.3 Hook Lba8.g(NotificationService50, StatusBarNotification)
+            // 10.3 Hook Lba8.f [v24.1.1] / Lba8.g [v24.0.3] (NotificationService50, StatusBarNotification)
             // Fix Notify's bug where LINE's RemoteViews (fl_btn_left / fl_btn_right) is skipped whenever
-            // android.title is non-empty, and accurately extract Answer (X) and Decline (W) PendingIntents.
-            Class<?> ba8Class = findClassSafe(cl, "ba8");
-            Class<?> ns50Class = findClassSafe(cl, "com.mc.miband1.NotificationService50");
-            if (ba8Class != null && ns50Class != null
-                    && hasMethod(ba8Class, "g", ns50Class, android.service.notification.StatusBarNotification.class)) {
-                XposedHelpers.findAndHookMethod(ba8Class, "g", ns50Class, android.service.notification.StatusBarNotification.class, new XC_MethodHook() {
+            // android.title is non-empty, and accurately extract Answer (U/X) and Decline (T/W) PendingIntents.
+            String ba8ParseMethod = (ba8Class != null && ns50Class != null && hasMethod(ba8Class, "f", ns50Class, android.service.notification.StatusBarNotification.class)) ? "f"
+                    : ((ba8Class != null && ns50Class != null && hasMethod(ba8Class, "g", ns50Class, android.service.notification.StatusBarNotification.class)) ? "g" : null);
+            if (ba8Class != null && ns50Class != null && ba8ParseMethod != null) {
+                HookBridge.findAndHookMethod(ba8Class, ba8ParseMethod, ns50Class, android.service.notification.StatusBarNotification.class, new HookBridge.MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
                         if (!isVoipCallFixEnabled(cl)) return;
@@ -4571,11 +4865,12 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                         }
                     }
                 });
+                logInfo("[VoipFix] Hooked Lba8." + ba8ParseMethod + "(NotificationService50, StatusBarNotification)");
             }
 
             // 10.4 Hook Lba8.b(NotificationService50, String) - VoIP call notification ended/removed
             if (ba8Class != null && ns50Class != null && hasMethod(ba8Class, "b", ns50Class, String.class)) {
-                XposedHelpers.findAndHookMethod(ba8Class, "b", ns50Class, String.class, new XC_MethodHook() {
+                HookBridge.findAndHookMethod(ba8Class, "b", ns50Class, String.class, new HookBridge.MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
                         if (!isVoipCallFixEnabled(cl)) return;
@@ -4603,19 +4898,19 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                 });
             }
 
-            // 10.5 Hook Lpa5.f(Lxp, int, byte[]) - ZeppOS Endpoint 0x1E incoming BLE commands from watch
+            // 10.5 Hook Lq25.f [v24.1.1] / Lpa5.f [v24.0.3] (Lxp, int, byte[]) - ZeppOS Endpoint 0x1E incoming BLE commands from watch
             // NOTE: Endpoint 0x1E only carries 05 01 (Reject/Dismiss), 05 02 (Silence), 05 03 (SMS).
             // Do NOT mark sAnsweredFromWatch here; Watch Answer is strictly detected via HFP ATA
-            // (ACTIVE_DEVICE_CHANGED / AUDIO_STATE_CHANGED pointing to watch, or Lyf0.a/b).
-            Class<?> pa5Class = findClassSafe(cl, "pa5");
+            // (ACTIVE_DEVICE_CHANGED / AUDIO_STATE_CHANGED pointing to watch, or Lzf0/Lyf0.a/b).
+            Class<?> pa5Class = findClassSafe(cl, "q25", "pa5");
             Class<?> xpClass = findClassSafe(cl, "xp");
             if (pa5Class != null && xpClass != null && hasMethod(pa5Class, "f", xpClass, int.class, byte[].class)) {
-                XposedHelpers.findAndHookMethod(pa5Class, "f", xpClass, int.class, byte[].class, new XC_MethodHook() {
+                HookBridge.findAndHookMethod(pa5Class, "f", xpClass, int.class, byte[].class, new HookBridge.MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         byte[] data = (byte[]) param.args[2];
                         if (data != null && data.length >= 2 && data[0] == 0x05) {
-                            logInfo("[VoipFix] Watch Endpoint 0x1E event received: 05 "
+                            logInfo("[VoipFix] Watch Endpoint 0x1E event received (" + pa5Class.getSimpleName() + ".f): 05 "
                                     + String.format("%02X", data[1])
                                     + " (withinVoip=" + isWithinVoipWindow()
                                     + ", answered=" + sVoipCallAnswered
@@ -4624,20 +4919,21 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
                         }
                     }
                 });
+                logInfo("[VoipFix] Hooked Endpoint 0x1E handler: " + pa5Class.getName() + ".f");
             }
 
             // 10.6 Hook Lyf0.w(Context, boolean) - Reject/Hangup Call
             // Prevents Case 1 (Immediate Call Drop) when the watch answers via HFP ATA and simultaneously
             // dismisses the BLE call alert (sending 05 01 on Endpoint 0x1E -> Loq.run -> Lyf0.w).
             if (yf0Class != null && hasMethod(yf0Class, "w", Context.class, boolean.class)) {
-                XposedHelpers.findAndHookMethod(yf0Class, "w", Context.class, boolean.class, new XC_MethodHook() {
+                HookBridge.findAndHookMethod(yf0Class, "w", Context.class, boolean.class, new HookBridge.MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         if (!isVoipCallFixEnabled(cl)) return;
                         final Context ctx = (Context) param.args[0];
                         boolean isVoipNow = false;
                         try {
-                            Boolean nRes = (Boolean) XposedHelpers.callMethod(param.thisObject, "n");
+                            Boolean nRes = (Boolean) HookBridge.callMethod(param.thisObject, "n");
                             isVoipNow = (nRes != null && nRes) || isWithinVoipWindow();
                         } catch (Throwable ignored) {
                             isVoipNow = isWithinVoipWindow();
@@ -4717,14 +5013,14 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
             // Ensure clean single-shot PendingIntent answer without double KEYCODE_HEADSETHOOK or forced Speakerphone,
             // followed immediately by Watch HFP SCO audio routing!
             if (yf0Class != null && hasMethod(yf0Class, "a", Context.class, boolean.class)) {
-                XposedHelpers.findAndHookMethod(yf0Class, "a", Context.class, boolean.class, new XC_MethodHook() {
+                HookBridge.findAndHookMethod(yf0Class, "a", Context.class, boolean.class, new HookBridge.MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         if (!isVoipCallFixEnabled(cl)) return;
                         final Context ctx = (Context) param.args[0];
                         boolean isVoipNow = false;
                         try {
-                            Boolean nRes = (Boolean) XposedHelpers.callMethod(param.thisObject, "n");
+                            Boolean nRes = (Boolean) HookBridge.callMethod(param.thisObject, "n");
                             isVoipNow = (nRes != null && nRes) || isWithinVoipWindow();
                         } catch (Throwable ignored) {
                             isVoipNow = isWithinVoipWindow();
@@ -4740,7 +5036,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
             }
 
             if (yf0Class != null && hasMethod(yf0Class, "b", Context.class)) {
-                XposedHelpers.findAndHookMethod(yf0Class, "b", Context.class, new XC_MethodHook() {
+                HookBridge.findAndHookMethod(yf0Class, "b", Context.class, new HookBridge.MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         if (!isVoipCallFixEnabled(cl)) return;
@@ -4769,8 +5065,8 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
             String pkg = sbn.getPackageName();
             Context ctx = (ns50 instanceof Context) ? ((Context) ns50).getApplicationContext() : sAppContext;
 
-            android.app.PendingIntent existingW = (android.app.PendingIntent) XposedHelpers.getObjectField(ns50, "W");
-            android.app.PendingIntent existingX = (android.app.PendingIntent) XposedHelpers.getObjectField(ns50, "X");
+            android.app.PendingIntent existingW = (android.app.PendingIntent) HookBridge.getObjectField(ns50, sNs50DeclineField);
+            android.app.PendingIntent existingX = (android.app.PendingIntent) HookBridge.getObjectField(ns50, sNs50AnswerField);
 
             android.app.PendingIntent foundDecline = null;
             android.app.PendingIntent foundAnswer = null;
@@ -4853,22 +5149,22 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
             }
 
             if (foundDecline != null) {
-                XposedHelpers.setObjectField(ns50, "W", foundDecline);
+                HookBridge.setObjectField(ns50, sNs50DeclineField, foundDecline);
                 sCachedVoipDeclineIntent = foundDecline;
             } else if (existingW != null) {
                 sCachedVoipDeclineIntent = existingW;
             }
 
             if (foundAnswer != null) {
-                XposedHelpers.setObjectField(ns50, "X", foundAnswer);
+                HookBridge.setObjectField(ns50, sNs50AnswerField, foundAnswer);
                 sCachedVoipAnswerIntent = foundAnswer;
             } else if (existingX != null) {
                 sCachedVoipAnswerIntent = existingX;
             }
 
             logInfo("[VoipFix] Extracted VoIP PendingIntents for " + pkg
-                    + " -> Answer(X)=" + sCachedVoipAnswerIntent
-                    + ", Decline(W)=" + sCachedVoipDeclineIntent
+                    + " -> Answer(" + sNs50AnswerField + ")=" + sCachedVoipAnswerIntent
+                    + ", Decline(" + sNs50DeclineField + ")=" + sCachedVoipDeclineIntent
                     + " (actionsCount=" + (n.actions != null ? n.actions.length : 0) + ")");
 
             // Check if this notification is actually an active In-Call notification (already answered)
@@ -4943,9 +5239,11 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
         try {
             Class<?> ns50Class = findClassSafe(cl, "com.mc.miband1.NotificationService50");
             if (ns50Class != null) {
-                Object z0 = XposedHelpers.getStaticObjectField(ns50Class, "z0");
-                if (z0 != null) {
-                    android.app.PendingIntent pi = (android.app.PendingIntent) XposedHelpers.getObjectField(z0, isAnswer ? "X" : "W");
+                resolveNotificationService50Fields(ns50Class);
+                Object inst = HookBridge.getStaticObjectField(ns50Class, sNs50InstanceField);
+                if (inst != null) {
+                    android.app.PendingIntent pi = (android.app.PendingIntent) HookBridge.getObjectField(
+                            inst, isAnswer ? sNs50AnswerField : sNs50DeclineField);
                     if (pi != null) return pi;
                 }
             }
@@ -4958,10 +5256,11 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
         try {
             Class<?> ns50Class = findClassSafe(cl, "com.mc.miband1.NotificationService50");
             if (ns50Class != null) {
-                Object z0 = XposedHelpers.getStaticObjectField(ns50Class, "z0");
-                if (z0 != null) {
-                    XposedHelpers.setObjectField(z0, "W", null);
-                    XposedHelpers.setObjectField(z0, "X", null);
+                resolveNotificationService50Fields(ns50Class);
+                Object inst = HookBridge.getStaticObjectField(ns50Class, sNs50InstanceField);
+                if (inst != null) {
+                    HookBridge.setObjectField(inst, sNs50DeclineField, null);
+                    HookBridge.setObjectField(inst, sNs50AnswerField, null);
                 }
             }
         } catch (Throwable ignored) {
@@ -5044,14 +5343,16 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
     }
 
     private static String getConfiguredWatchMac(Context ctx, ClassLoader cl) {
+        String mac = getWatchBleMac(ctx, cl);
+        if (mac != null && !mac.isEmpty()) return mac;
         try {
             if (cl != null && ctx != null) {
                 Class<?> upClass = findClassSafe(cl, "com.mc.miband1.model.UserPreferences");
                 if (upClass != null) {
-                    Object up = XposedHelpers.callStaticMethod(upClass, "getInstance", ctx);
-                    if (up != null && hasMethod(upClass, "z2")) {
-                        String mac = (String) XposedHelpers.callMethod(up, "z2");
-                        if (mac != null && !mac.isEmpty()) return mac;
+                    Object up = HookBridge.callStaticMethod(upClass, "getInstance", ctx);
+                    if (up != null && hasMethodWithReturn(upClass, "z2", String.class)) {
+                        String z2Mac = (String) HookBridge.callMethod(up, "z2");
+                        if (z2Mac != null && !z2Mac.isEmpty()) return z2Mac;
                     }
                 }
             }
@@ -5295,16 +5596,7 @@ public class NotifyWeatherHook implements IXposedHookLoadPackage {
 
     private static android.bluetooth.BluetoothDevice findWatchHeadsetDevice(Context ctx, ClassLoader cl) {
         try {
-            String watchMac = null;
-            if (cl != null && ctx != null) {
-                Class<?> upClass = findClassSafe(cl, "com.mc.miband1.model.UserPreferences");
-                if (upClass != null) {
-                    Object up = XposedHelpers.callStaticMethod(upClass, "getInstance", ctx);
-                    if (up != null && hasMethod(upClass, "z2")) {
-                        watchMac = (String) XposedHelpers.callMethod(up, "z2");
-                    }
-                }
-            }
+            String watchMac = getConfiguredWatchMac(ctx, cl);
             if (sCachedBluetoothHeadset != null) {
                 List<android.bluetooth.BluetoothDevice> connected = sCachedBluetoothHeadset.getConnectedDevices();
                 if (connected != null && !connected.isEmpty()) {

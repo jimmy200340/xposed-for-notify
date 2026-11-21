@@ -74,7 +74,11 @@ public class MainActivity extends Activity {
                 makePrefsWorldReadable();
 
                 if (hookActive && tvHookStatus != null) {
-                    tvHookStatus.setText("● LSPosed 模組已生效 (Notify v24.0.3 已連線)");
+                    String notifyVer = intent.getStringExtra("notify_version");
+                    String xposedApi = intent.getStringExtra("xposed_api");
+                    String verLabel = (notifyVer != null && !notifyVer.isEmpty()) ? ("Notify v" + notifyVer) : "Notify";
+                    String apiSuffix = (xposedApi != null && !xposedApi.isEmpty()) ? (" · " + xposedApi) : "";
+                    tvHookStatus.setText("● LSPosed 模組已生效 (" + verLabel + apiSuffix + " 已連線)");
                     tvHookStatus.setTextColor(Color.parseColor("#66BB6A"));
                 }
                 if (progressMsg != null && tvAgpsProgress != null) {
@@ -279,7 +283,7 @@ public class MainActivity extends Activity {
         swWeather = new Switch(this);
         root.addView(createSwitchCard(
                 "🌤️ 天氣同步修正 (Weather Hook)",
-                "修復 Zepp OS 6 天氣封包結構與真實地點名稱提取 (支援 v24.0.3 原生與加強修正)",
+                "修復 Zepp OS 6 天氣封包結構與真實地點名稱提取 (支援 v24.1.1 原生與加強修正)",
                 swWeather
         ));
         addSpacer(root, 10);

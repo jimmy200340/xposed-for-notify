@@ -75,8 +75,16 @@ if ($env:NOTIFY_MOD_KEYSTORE -and (Test-Path $env:NOTIFY_MOD_KEYSTORE)) {
 # Optional dexsql verification tool
 $dexsql = $env:DEXSQL_PATH
 if (-not $dexsql) {
-    $candidateDexsql = Join-Path $env:USERPROFILE "Pictures\Google Map\dexsql-windows-amd64.exe"
-    if (Test-Path $candidateDexsql) { $dexsql = $candidateDexsql }
+    $dexsqlCmd = Get-Command dexsql -ErrorAction SilentlyContinue
+    if ($dexsqlCmd) { $dexsql = $dexsqlCmd.Source }
+}
+if (-not $dexsql) {
+    foreach ($candidateDexsql in @(
+        (Join-Path $env:LOCALAPPDATA "DexSQL\0.1.1\dexsql.exe"),
+        (Join-Path $env:USERPROFILE "Pictures\Google Map\dexsql-windows-amd64.exe")
+    )) {
+        if (Test-Path $candidateDexsql) { $dexsql = $candidateDexsql; break }
+    }
 }
 
 $env:JAVA_HOME = $jdkDir
@@ -104,23 +112,25 @@ if (-not (Test-Path $keystore)) {
     if ($LASTEXITCODE -ne 0) { throw "keytool failed with exit code $LASTEXITCODE" }
 }
 
-Write-Host "=== 2. Compiling Xposed API stubs separately into xposed_api ==="
+Write-Host "=== 2. Compiling Xposed & libxposed API stubs separately into xposed_api ==="
 $stubJavaFiles = Get-ChildItem -Recurse $xposedStubs -Filter *.java | ForEach-Object { $_.FullName }
-& $javac -encoding UTF-8 -cp $androidJar -d $xposedApiDir $stubJavaFiles
+& $javac -source 17 -target 17 -encoding UTF-8 -cp $androidJar -d $xposedApiDir $stubJavaFiles
 if ($LASTEXITCODE -ne 0) { throw "Compiling Xposed API stubs failed with exit code $LASTEXITCODE" }
-Write-Host "Xposed API stubs compiled to $xposedApiDir"
+Write-Host "Xposed/libxposed API stubs compiled to $xposedApiDir"
 
 Write-Host "=== 3. Compiling module Java classes with xposed_api on classpath (compileOnly) ==="
 $modJavaFiles = Get-ChildItem -Recurse "$projDir\src" -Filter *.java | ForEach-Object { $_.FullName }
-& $javac -encoding UTF-8 -cp "$androidJar;$xposedApiDir" -d $classesDir $modJavaFiles
+& $javac -source 17 -target 17 -encoding UTF-8 -cp "$androidJar;$xposedApiDir" -d $classesDir $modJavaFiles
 if ($LASTEXITCODE -ne 0) { throw "Compiling module classes failed with exit code $LASTEXITCODE" }
 
-# Verify that NO de.robv.android.xposed classes were created in build_out\classes
+# Verify that NO de.robv.android.xposed or io.github.libxposed classes were created in build_out\classes
 if (Test-Path "$classesDir\de") {
-    Write-Error "CRITICAL ERROR: de.robv.android.xposed classes detected in $classesDir! Removing them..."
-    Remove-Item -Recurse -Force "$classesDir\de"
+    throw "CRITICAL ERROR: de.robv.android.xposed classes detected in $classesDir!"
 }
-Write-Host "Verified: $classesDir contains ONLY module classes!"
+if (Test-Path "$classesDir\io\github\libxposed") {
+    throw "CRITICAL ERROR: io.github.libxposed classes detected in $classesDir!"
+}
+Write-Host "Verified: $classesDir contains ONLY module classes (compileOnly stubs excluded)!"
 
 Write-Host "=== 4. Compiling and linking resources with AAPT2 ==="
 & $aapt2 compile --dir "$projDir\res" -o "$projDir\build_out\res.zip"
@@ -133,19 +143,30 @@ $modJar = "$projDir\build_out\module_classes.jar"
 $xposedJar = "$projDir\build_out\xposed_api.jar"
 & $jarExe cf $modJar -C $classesDir .
 & $jarExe cf $xposedJar -C $xposedApiDir .
-& $d8 --output $dexDir --lib $androidJar --classpath $xposedJar $modJar
+& $d8 --min-api 28 --output $dexDir --lib $androidJar --classpath $xposedJar $modJar
 if ($LASTEXITCODE -ne 0) { throw "Dexing module classes failed with exit code $LASTEXITCODE" }
 
-Write-Host "=== 6. Packaging classes.dex into APK ==="
+Write-Host "=== 6. Packaging classes.dex and META-INF/xposed/* into APK ==="
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $zip = [System.IO.Compression.ZipFile]::Open("$apkDir\unaligned.apk", [System.IO.Compression.ZipArchiveMode]::Update)
 try {
     [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, "$dexDir\classes.dex", "classes.dex", [System.IO.Compression.CompressionLevel]::Optimal) | Out-Null
+
+    $metaXposedDir = Join-Path $projDir "resources\META-INF\xposed"
+    if (Test-Path $metaXposedDir) {
+        Get-ChildItem -File $metaXposedDir | ForEach-Object {
+            $entryName = "META-INF/xposed/$($_.Name)"
+            $existing = $zip.GetEntry($entryName)
+            if ($existing) { $existing.Delete() }
+            [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $_.FullName, $entryName, [System.IO.Compression.CompressionLevel]::Optimal) | Out-Null
+            Write-Host "Added $entryName"
+        }
+    }
 } finally {
     $zip.Dispose()
 }
-Write-Host "Successfully added classes.dex to APK"
+Write-Host "Successfully added classes.dex and META-INF/xposed/* to APK"
 
 Write-Host "=== 7. Zipaligning APK ==="
 & $zipalign -p -f 4 "$apkDir\unaligned.apk" "$apkDir\aligned.apk"
@@ -163,8 +184,21 @@ Write-Host "=== 9. Verifying signed APK ==="
 & $apksigner verify -v $finalApk
 
 if ($dexsql -and (Test-Path $dexsql)) {
-    Write-Host "=== 10. Verifying with dexsql: Ensure NO xposed class definitions in APK ==="
-    & $dexsql query --input $finalApk --sql "SELECT t.descriptor FROM class_defs c JOIN types t ON c.class_idx = t.type_idx WHERE t.descriptor LIKE '%xposed%';"
+    Write-Host "=== 10. Verifying with dexsql: Ensure NO framework stub classes in APK ==="
+    $stubCheck = & $dexsql query --input $finalApk --sql "SELECT descriptor FROM classes WHERE descriptor LIKE 'Lde/robv/android/xposed/%' OR descriptor LIKE 'Lio/github/libxposed/%';"
+    Write-Host $stubCheck
+    if ($stubCheck -match "Lde/robv/android/xposed/|Lio/github/libxposed/") {
+        throw "CRITICAL ERROR: Framework stub classes found inside classes.dex!"
+    }
+    Write-Host "=== 11. Verifying API 102 isolation: Ensure NO legacy Xposed calls outside LegacyXposedEntry ==="
+    $isoCheck = & $dexsql query --input $finalApk --sql "SELECT DISTINCT method_class, callee_class FROM method_calls WHERE callee_class LIKE 'Lde/robv/android/xposed/%' AND method_class NOT LIKE 'Lcom/amazfit/balance2fix/LegacyXposedEntry%';"
+    Write-Host $isoCheck
+    if ($isoCheck -match "Lde/robv/android/xposed/") {
+        throw "CRITICAL ERROR: Legacy de.robv.android.xposed.* call detected outside LegacyXposedEntry!"
+    }
+    Write-Host "=== 12. Verifying no reflection strings to de.robv.android.xposed in core ==="
+    $strCheck = & $dexsql query --input $finalApk --sql "SELECT value FROM strings WHERE value LIKE '%de.robv.android.xposed%';"
+    Write-Host $strCheck
 }
 
 Write-Host "BUILD SUCCESS: $finalApk"
