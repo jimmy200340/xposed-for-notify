@@ -32,7 +32,7 @@ import java.util.zip.ZipFile;
  */
 public final class NotifyAutoResolver {
 
-    private static final String CACHE_SCHEMA_VERSION = "1.2";
+    private static final String CACHE_SCHEMA_VERSION = "1.3";
 
     private static final String DESC_BLE_MANAGER = "Lcom/mc/miband1/bluetooth/BLEManager;";
     private static final String DESC_GATT_CALLBACK = "Landroid/bluetooth/BluetoothGattCallback;";
@@ -513,7 +513,11 @@ public final class NotifyAutoResolver {
                         "rejectCall - reject mechanisms failed; falling back to muteCall",
                         "muteCall requested - incomingCallNow=",
                         "Unknown number - call ignored",
-                        "com.mc.miband.stopIncomingCall"
+                        "com.mc.miband.stopIncomingCall",
+                        "silenceRinger",
+                        "getITelephony",
+                        "android.permission.CALL_PRIVILEGED",
+                        "5533acf8-a035-45c2-bd70-ed7546552523"
                 }, null);
                 if (m != null) {
                     out.voipNotifyHelperClass = descriptorToJavaName(m.classDesc);
@@ -675,11 +679,16 @@ public final class NotifyAutoResolver {
                 }
             }
 
-            // 2G. Expand BLE HTTP Proxy (subclass of baseEndpointClass referencing weatherProxyStatusUpdate)
+            // 2G. Expand BLE HTTP Proxy (subclass of baseEndpointClass referencing Zepp OS HTTP proxy URI or legacy action)
             if (baseEpDesc != null && out.bleHttpProxyClass == null) {
                 int baseTypeIdx = dex.findTypeIndex(baseEpDesc);
                 if (baseTypeIdx >= 0) {
-                    for (String pStr : new String[]{"com.mc.miband.weatherProxyStatusUpdate", "weatherProxyStatusUpdate"}) {
+                    for (String pStr : new String[]{
+                            "httpproxy://download?sessionid=",
+                            "com.huami.midong/settings",
+                            "com.mc.miband.weatherProxyStatusUpdate",
+                            "weatherProxyStatusUpdate"
+                    }) {
                         int proxyStrIdx = dex.findStringIndex(pStr);
                         if (proxyStrIdx >= 0) {
                             MethodRef m = dex.findMethodReferencingStringInSubclass(proxyStrIdx, baseTypeIdx);
