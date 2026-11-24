@@ -5,3 +5,4 @@ build_out/
 .DS_Store
 Thumbs.db
 *.log
+zepp_ha_lights/node_modules/

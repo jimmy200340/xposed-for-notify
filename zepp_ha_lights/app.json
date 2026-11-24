@@ -1,0 +1,66 @@
+{
+  "configVersion": "v3",
+  "app": {
+    "appId": 1066510,
+    "appName": "HA 電燈",
+    "appType": "app",
+    "version": {
+      "code": 1,
+      "name": "1.0.0"
+    },
+    "icon": "icon.png",
+    "vender": "NotifyBalance2Fix",
+    "description": "Control Home Assistant lights over BLE bridge (NotifyBalance2Fix / Zepp Side Service)"
+  },
+  "permissions": [
+    "data:os.device.info"
+  ],
+  "runtime": {
+    "apiVersion": {
+      "compatible": "3.0.0",
+      "target": "3.0.0",
+      "minVersion": "3.0.0"
+    }
+  },
+  "targets": {
+    "balance2": {
+      "module": {
+        "page": {
+          "pages": [
+            "page/index"
+          ]
+        },
+        "app-side": {
+          "path": "app-side/index"
+        },
+        "setting": {
+          "path": "setting/index"
+        }
+      },
+      "platforms": [
+        {
+          "name": "balance2-9568512",
+          "deviceSource": 9568512
+        },
+        {
+          "name": "balance2-9568513",
+          "deviceSource": 9568513
+        },
+        {
+          "name": "balance2-9568515",
+          "deviceSource": 9568515
+        }
+      ],
+      "designWidth": 480
+    }
+  },
+  "i18n": {
+    "en-US": {
+      "appName": "HA Lights"
+    },
+    "zh-TW": {
+      "appName": "HA 電燈"
+    }
+  },
+  "defaultLanguage": "zh-TW"
+}

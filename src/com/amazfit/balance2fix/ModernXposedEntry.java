@@ -109,7 +109,7 @@ public class ModernXposedEntry extends XposedModule {
     @Override
     public void onPackageReady(PackageReadyParam param) {
         if (param == null) return;
-        NotifyWeatherHook.initForPackage(param.getPackageName(), param.getClassLoader());
+        NotifyWeatherHook.initForPackage(param.getPackageName(), param.getClassLoader(), param.getApplicationInfo());
     }
 
     private String buildApiDescription() {

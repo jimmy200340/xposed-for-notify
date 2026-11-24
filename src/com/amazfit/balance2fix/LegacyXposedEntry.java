@@ -1,6 +1,7 @@
 package com.amazfit.balance2fix;
 
 import android.content.SharedPreferences;
+import android.content.pm.ApplicationInfo;
 import android.util.Log;
 
 import java.lang.reflect.Method;
@@ -100,7 +101,12 @@ public class LegacyXposedEntry implements IXposedHookLoadPackage {
             }
         });
 
-        NotifyWeatherHook.initForPackage(lpparam.packageName, lpparam.classLoader);
+        ApplicationInfo appInfo = null;
+        try {
+            appInfo = (ApplicationInfo) lpparam.getClass().getField("appInfo").get(lpparam);
+        } catch (Throwable ignored) {
+        }
+        NotifyWeatherHook.initForPackage(lpparam.packageName, lpparam.classLoader, appInfo);
     }
 
     private static String buildApiDescription() {

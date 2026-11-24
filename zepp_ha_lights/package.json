@@ -1,0 +1,15 @@
+{
+  "name": "zepp-ha-lights",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Home Assistant Lights Controller for Amazfit Balance 2 (Zepp OS + NotifyBalance2Fix Endpoint 0xA0 Bridge)",
+  "scripts": {
+    "build": "zeus build"
+  },
+  "dependencies": {
+    "@zeppos/zml": "^0.0.43"
+  },
+  "devDependencies": {
+    "@zeppos/zeus-cli": "^1.10.2"
+  }
+}

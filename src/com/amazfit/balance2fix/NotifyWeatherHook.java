@@ -40,18 +40,24 @@ public class NotifyWeatherHook {
 
     private static final String TAG = "Balance2WeatherFix";
     static final String TARGET_PACKAGE = "com.mc.amazfit1";
+    private static final String RESOLVER_CACHE_REL = "cache/notify_balance2_auto_resolver_v1.prop";
     private static final AtomicBoolean sHooksInitialized = new AtomicBoolean(false);
+    private static volatile NotifyAutoResolver.ResolvedTargets sAutoTargets = null;
     private static final String ACTION_TRIGGER_SYNC = "com.amazfit.balance2fix.TRIGGER_SYNC";
     private static final String ACTION_DUMP_GATT = "com.amazfit.balance2fix.DUMP_GATT";
     private static final String ACTION_GATT_RESULT = "com.amazfit.balance2fix.GATT_RESULT";
     private static final String ACTION_PAIR_UNLOCK_CHAR = "com.amazfit.balance2fix.PAIR_UNLOCK_CHAR";
     private static final String ACTION_AGPS_INTERNAL_PROGRESS = "com.amazfit.balance2fix.AGPS_INTERNAL_PROGRESS";
 
-    // Module 4-Switch Configuration States (Synced from MainActivity & persisted in SharedPreferences)
+    // Module 5-Switch Configuration States (Synced from MainActivity & persisted in SharedPreferences)
     private static volatile boolean sEnableWeatherFix = true;
     private static volatile boolean sEnableAgpsFix = true;
     private static volatile boolean sEnableBtUnlock = true;
     private static volatile boolean sEnableVoipCallFix = true;
+    private static volatile boolean sEnableHaBridge = true;
+    private static volatile String sHaUrl = "";
+    private static volatile String sHaToken = "";
+    private static volatile String sHaFilter = "";
     private static volatile int sAgpsFormatMode = 2; // 2 = EPO (0x8C/0x8D/0x8E, verified Balance 2 bitmask 0x000F1C00), 3 = 7d LTO (0x8B), 4 = 2d LTO
     private static volatile long sAgpsLastUpdateMs = 0L;
     private static volatile long sAgpsExpireMs = 0L;
@@ -72,11 +78,22 @@ public class NotifyWeatherHook {
     private static final String PREF_MOD_AGPS = "balance2_mod_enable_agps";
     private static final String PREF_MOD_BT_UNLOCK = "balance2_mod_enable_bt_unlock";
     private static final String PREF_MOD_VOIP_CALL = "balance2_mod_enable_voip_call";
+    private static final String PREF_MOD_HA_BRIDGE = "balance2_mod_enable_ha_bridge";
+    private static final String PREF_MOD_HA_URL = "balance2_mod_ha_url";
+    private static final String PREF_MOD_HA_TOKEN = "balance2_mod_ha_token";
+    private static final String PREF_MOD_HA_FILTER = "balance2_mod_ha_filter";
     private static final String PREF_MOD_AGPS_FORMAT = "balance2_mod_agps_format";
     private static final String PREF_AGPS_MIGRATED_EPO_V1 = "balance2_agps_migrated_epo_v1";
     private static final String PREF_AGPS_LAST_UPDATE_MS = "balance2_agps_last_update_ms";
     private static final String PREF_AGPS_EXPIRE_MS = "balance2_agps_expire_ms";
     private static final String NOTIFY_AGPS_TIME_KEY = "22d907dc-6606-4aac-ba8d-d6219402818e";
+
+    // Home Assistant Endpoint 0xA0 BLE Bridge state (Watch Mini Program AppID 1066510)
+    private static final long HA_LIGHTS_APP_ID = 1066510L;
+    private static final Set<String> sHookedHaA0Classes = Collections.synchronizedSet(new HashSet<>());
+    private static final java.util.concurrent.ExecutorService sHaExecutor = java.util.concurrent.Executors.newFixedThreadPool(3);
+    private static volatile Method sHaSendRawMethod = null;
+    private static volatile boolean sHaSendRawIs5Args = false;
 
     // Notify v24.1.1 internal broadcast action UUIDs
     private static final String ACTION_NOTIFY_DO_AGPS_UUID = "fc53784d-e0be-463a-924d-bd6c1d8a11a3";
@@ -145,6 +162,30 @@ public class NotifyWeatherHook {
         return null;
     }
 
+    private static Class<?> resolveTargetClass(ClassLoader cl, String autoResolvedName, String... fallbacks) {
+        if (autoResolvedName != null && !autoResolvedName.isEmpty()) {
+            Class<?> c = HookBridge.findClassIfExists(autoResolvedName, cl);
+            if (c != null) return c;
+        }
+        return findClassSafe(cl, fallbacks);
+    }
+
+    private static synchronized void resolveAutoTargetsIfNeeded(android.content.pm.ApplicationInfo appInfo) {
+        if (sAutoTargets != null && sAutoTargets.isCoreComplete()) return;
+        if (appInfo == null || appInfo.sourceDir == null || appInfo.sourceDir.isEmpty()) return;
+        try {
+            java.io.File cacheFile = (appInfo.dataDir != null && !appInfo.dataDir.isEmpty())
+                    ? new java.io.File(appInfo.dataDir, RESOLVER_CACHE_REL)
+                    : null;
+            NotifyAutoResolver.ResolvedTargets resolved = NotifyAutoResolver.resolveOrLoadCache(appInfo.sourceDir, cacheFile);
+            sAutoTargets = resolved;
+            logInfo("[AutoResolver] [" + (resolved.fromCache ? "CACHE 0ms" : ("SCAN " + resolved.resolveTimeMs + "ms"))
+                    + "]: " + resolved.toSummaryString());
+        } catch (Throwable t) {
+            logError("[AutoResolver] Failed to scan Notify APK; falling back to static names", t);
+        }
+    }
+
     private static boolean hasMethod(Class<?> clazz, String name, Class<?>... paramTypes) {
         if (clazz == null) return false;
         try {
@@ -166,6 +207,11 @@ public class NotifyWeatherHook {
     }
 
     private static Class<?> resolveWeatherDataClass(ClassLoader cl) {
+        NotifyAutoResolver.ResolvedTargets t = sAutoTargets;
+        if (t != null && t.weatherDataClass != null && !t.weatherDataClass.isEmpty()) {
+            Class<?> c = HookBridge.findClassIfExists(t.weatherDataClass, cl);
+            if (c != null) return c;
+        }
         Class<?> userPrefsClass = findClassSafe(cl, "com.mc.miband1.model.UserPreferences");
         if (userPrefsClass != null) {
             for (String mName : new String[]{"D7", "w7"}) {
@@ -236,19 +282,24 @@ public class NotifyWeatherHook {
     }
 
     public static void initForPackage(String packageName, ClassLoader cl) {
+        initForPackage(packageName, cl, null);
+    }
+
+    public static void initForPackage(String packageName, ClassLoader cl, android.content.pm.ApplicationInfo appInfo) {
         if (!TARGET_PACKAGE.equals(packageName) || cl == null) {
             return;
         }
         if (!sHooksInitialized.compareAndSet(false, true)) {
             return;
         }
-        new NotifyWeatherHook().installHooks(packageName, cl);
+        new NotifyWeatherHook().installHooks(packageName, cl, appInfo);
     }
 
-    private void installHooks(String packageName, final ClassLoader cl) {
-        logInfo("Initializing NotifyBalance2Fix (v4.2 [" + HookBridge.getApiDescription()
-                + "] - Notify v24.1.1/v24.0.3 Weather + ZeppOS 6 AGPS + HyperOS Unlock + VoIP) for " + packageName);
+    private void installHooks(String packageName, final ClassLoader cl, android.content.pm.ApplicationInfo appInfo) {
+        logInfo("Initializing NotifyBalance2Fix (v4.4 [" + HookBridge.getApiDescription()
+                + "] - Dynamic Auto-Resolver + Weather + ZeppOS 6 AGPS + HyperOS Unlock + VoIP + HA 0xA0) for " + packageName);
 
+        resolveAutoTargetsIfNeeded(appInfo);
         loadModuleConfigFromPrefs(null, cl);
 
         hookApplicationContext(cl);
@@ -263,12 +314,14 @@ public class NotifyWeatherHook {
         hookAgpsFixPipeline(cl);
         hookBandSettingsUnlockUI(cl);
         hookVoipCallPipeline(cl);
+        hookHomeAssistantEndpointA0(cl);
+        hookZeppDfuV5AppInstaller(cl);
 
         logInfo("All hooks installed for " + packageName);
     }
 
     // =========================================================================
-    // 0. Application Context, 4-Switch Config Sync & Debug Trigger Receiver
+    // 0. Application Context, 5-Switch Config Sync & Debug Trigger Receiver
     // =========================================================================
     private static boolean isWeatherFixEnabled(ClassLoader cl) {
         return sEnableWeatherFix;
@@ -286,6 +339,10 @@ public class NotifyWeatherHook {
         return sEnableVoipCallFix;
     }
 
+    private static boolean isHaBridgeEnabled(ClassLoader cl) {
+        return sEnableHaBridge;
+    }
+
     private static void loadModuleConfigFromPrefs(Context ctx, ClassLoader cl) {
         try {
             // 1. Try reading from Notify's own SharedPreferences (persisted via ACTION_UPDATE_CONFIG)
@@ -295,6 +352,10 @@ public class NotifyWeatherHook {
                 if (sp.contains(PREF_MOD_AGPS)) sEnableAgpsFix = sp.getBoolean(PREF_MOD_AGPS, true);
                 if (sp.contains(PREF_MOD_BT_UNLOCK)) sEnableBtUnlock = sp.getBoolean(PREF_MOD_BT_UNLOCK, true);
                 if (sp.contains(PREF_MOD_VOIP_CALL)) sEnableVoipCallFix = sp.getBoolean(PREF_MOD_VOIP_CALL, true);
+                if (sp.contains(PREF_MOD_HA_BRIDGE)) sEnableHaBridge = sp.getBoolean(PREF_MOD_HA_BRIDGE, true);
+                if (sp.contains(PREF_MOD_HA_URL)) sHaUrl = sp.getString(PREF_MOD_HA_URL, "");
+                if (sp.contains(PREF_MOD_HA_TOKEN)) sHaToken = sp.getString(PREF_MOD_HA_TOKEN, "");
+                if (sp.contains(PREF_MOD_HA_FILTER)) sHaFilter = sp.getString(PREF_MOD_HA_FILTER, "");
                 if (sp.contains(PREF_MOD_AGPS_FORMAT)) {
                     sAgpsFormatMode = sp.getInt(PREF_MOD_AGPS_FORMAT, 2);
                 }
@@ -328,6 +389,21 @@ public class NotifyWeatherHook {
                     if (xsp.contains(MainActivity.KEY_VOIP_CALL_FIX)) {
                         sEnableVoipCallFix = xsp.getBoolean(MainActivity.KEY_VOIP_CALL_FIX, sEnableVoipCallFix);
                     }
+                    if (xsp.contains(MainActivity.KEY_HA_BRIDGE_FIX)) {
+                        sEnableHaBridge = xsp.getBoolean(MainActivity.KEY_HA_BRIDGE_FIX, sEnableHaBridge);
+                    }
+                    if (xsp.contains(MainActivity.KEY_HA_URL)) {
+                        String u = xsp.getString(MainActivity.KEY_HA_URL, "");
+                        if (u != null && !u.isEmpty()) sHaUrl = u;
+                    }
+                    if (xsp.contains(MainActivity.KEY_HA_TOKEN)) {
+                        String tk = xsp.getString(MainActivity.KEY_HA_TOKEN, "");
+                        if (tk != null && !tk.isEmpty()) sHaToken = tk;
+                    }
+                    if (xsp.contains(MainActivity.KEY_HA_FILTER)) {
+                        String fl = xsp.getString(MainActivity.KEY_HA_FILTER, "");
+                        if (fl != null) sHaFilter = fl;
+                    }
                 }
             } catch (Throwable ignored) {
             }
@@ -335,7 +411,7 @@ public class NotifyWeatherHook {
             Context appCtx = ctx != null ? ctx.getApplicationContext() : sAppContext;
             if (appCtx != null && cl != null) {
                 try {
-                    Class<?> ux7Class = findClassSafe(cl, "yx7", "ux7");
+                    Class<?> ux7Class = resolveTargetClass(cl, sAutoTargets != null ? sAutoTargets.agpsTimeHelperClass : null, "yx7", "ux7");
                     if (ux7Class != null && hasMethod(ux7Class, "e", Context.class, String.class)) {
                         long notifyAgpsTime = (Long) HookBridge.callStaticMethod(ux7Class, "e", appCtx, NOTIFY_AGPS_TIME_KEY);
                         if (notifyAgpsTime > sAgpsLastUpdateMs) {
@@ -361,6 +437,10 @@ public class NotifyWeatherHook {
                 ed.putBoolean(PREF_MOD_AGPS, sEnableAgpsFix);
                 ed.putBoolean(PREF_MOD_BT_UNLOCK, sEnableBtUnlock);
                 ed.putBoolean(PREF_MOD_VOIP_CALL, sEnableVoipCallFix);
+                ed.putBoolean(PREF_MOD_HA_BRIDGE, sEnableHaBridge);
+                ed.putString(PREF_MOD_HA_URL, sHaUrl != null ? sHaUrl : "");
+                ed.putString(PREF_MOD_HA_TOKEN, sHaToken != null ? sHaToken : "");
+                ed.putString(PREF_MOD_HA_FILTER, sHaFilter != null ? sHaFilter : "");
                 ed.putInt(PREF_MOD_AGPS_FORMAT, sAgpsFormatMode);
                 if (sAgpsLastUpdateMs > 0L) ed.putLong(PREF_AGPS_LAST_UPDATE_MS, sAgpsLastUpdateMs);
                 if (sAgpsExpireMs > 0L) ed.putLong(PREF_AGPS_EXPIRE_MS, sAgpsExpireMs);
@@ -379,6 +459,9 @@ public class NotifyWeatherHook {
             report.addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES);
             report.putExtra("hook_active", true);
             report.putExtra("xposed_api", HookBridge.getApiDescription());
+            if (sAutoTargets != null) {
+                report.putExtra("resolver_status", sAutoTargets.toShortStatusString());
+            }
             try {
                 String verName = ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0).versionName;
                 if (verName != null) {
@@ -435,6 +518,19 @@ public class NotifyWeatherHook {
                         sEnableAgpsFix = intent.getBooleanExtra(MainActivity.KEY_AGPS_FIX, sEnableAgpsFix);
                         sEnableBtUnlock = intent.getBooleanExtra(MainActivity.KEY_BT_UNLOCK, sEnableBtUnlock);
                         sEnableVoipCallFix = intent.getBooleanExtra(MainActivity.KEY_VOIP_CALL_FIX, sEnableVoipCallFix);
+                        sEnableHaBridge = intent.getBooleanExtra(MainActivity.KEY_HA_BRIDGE_FIX, sEnableHaBridge);
+                        if (intent.hasExtra(MainActivity.KEY_HA_URL)) {
+                            String u = intent.getStringExtra(MainActivity.KEY_HA_URL);
+                            sHaUrl = u != null ? u.trim() : "";
+                        }
+                        if (intent.hasExtra(MainActivity.KEY_HA_TOKEN)) {
+                            String tk = intent.getStringExtra(MainActivity.KEY_HA_TOKEN);
+                            sHaToken = tk != null ? tk.trim() : "";
+                        }
+                        if (intent.hasExtra(MainActivity.KEY_HA_FILTER)) {
+                            String fl = intent.getStringExtra(MainActivity.KEY_HA_FILTER);
+                            sHaFilter = fl != null ? fl.trim() : "";
+                        }
                         if (intent.hasExtra(MainActivity.KEY_AGPS_FORMAT)) {
                             int reqMode = intent.getIntExtra(MainActivity.KEY_AGPS_FORMAT, sAgpsFormatMode);
                             if (sWatchAgpsCapMask != 0L
@@ -448,6 +544,8 @@ public class NotifyWeatherHook {
                         saveModuleConfigToNotifyPrefs(cl);
                         logInfo("[ConfigSync] Updated switches -> weather=" + sEnableWeatherFix
                                 + ", agps=" + sEnableAgpsFix + ", btUnlock=" + sEnableBtUnlock
+                                + ", voip=" + sEnableVoipCallFix + ", haBridge=" + sEnableHaBridge
+                                + ", haUrl='" + sHaUrl + "', hasHaToken=" + (sHaToken != null && !sHaToken.isEmpty())
                                 + ", agpsFormat=" + sAgpsFormatMode);
                         refreshBandSettingsRowsOnUiThread(cl);
                         broadcastStatusToModuleApp(ctx, null);
@@ -534,16 +632,24 @@ public class NotifyWeatherHook {
                         new Thread(() -> runOneClickAgpsUpdateInService(ctx, cl, mode), "Balance2Fix-OneClickAgps").start();
                         return;
                     }
+                    if (MainActivity.ACTION_INSTALL_ZPK.equals(action)) {
+                        final byte[] devZipBytes = intent.getByteArrayExtra("zpk_device_zip_bytes");
+                        final String appLabel = intent.getStringExtra("zpk_app_label");
+                        new Thread(() -> runOfficialZeppDfuV5ZpkInstall(ctx, cl, devZipBytes, appLabel), "Balance2Fix-ZeppDfuV5").start();
+                        return;
+                    }
                     new Thread(() -> {
                         try {
                             dumpWatchGattAndMiBleStatus(ctx, cl, false);
                             loadRealLocationFromPrefs(cl);
                             if (isWeatherFixEnabled(cl)) {
-                                // Trigger Weather Sync via Lif8.l(ctx, true) [v24.1.1] or Llf8/Lif8.k(ctx, true) [v24.0.3]
-                                Class<?> syncClass = findClassSafe(cl, "if8", "lf8");
+                                // Trigger Weather Sync via auto-resolved weatherSyncClass (Lif8/Lhf8/Llf8)
+                                Class<?> syncClass = resolveTargetClass(cl, sAutoTargets != null ? sAutoTargets.weatherSyncClass : null, "if8", "lf8");
                                 if (syncClass != null) {
-                                    String triggerMethod = hasMethod(syncClass, "l", Context.class, boolean.class) ? "l"
-                                            : (hasMethod(syncClass, "k", Context.class, boolean.class) ? "k" : null);
+                                    String autoTrig = sAutoTargets != null ? sAutoTargets.weatherTriggerMethod : null;
+                                    String triggerMethod = (autoTrig != null && hasMethod(syncClass, autoTrig, Context.class, boolean.class)) ? autoTrig
+                                            : (hasMethod(syncClass, "l", Context.class, boolean.class) ? "l"
+                                            : (hasMethod(syncClass, "k", Context.class, boolean.class) ? "k" : null));
                                     if (triggerMethod != null) {
                                         for (Field f : syncClass.getDeclaredFields()) {
                                             if (f.getType() == syncClass) {
@@ -575,6 +681,7 @@ public class NotifyWeatherHook {
             filter.addAction(ACTION_PAIR_UNLOCK_CHAR);
             filter.addAction("com.amazfit.balance2fix.QUERY_AGPS_0A");
             filter.addAction(MainActivity.ACTION_ONE_CLICK_AGPS);
+            filter.addAction(MainActivity.ACTION_INSTALL_ZPK);
             if (Build.VERSION.SDK_INT >= 33) {
                 ctx.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED);
             } else {
@@ -777,15 +884,21 @@ public class NotifyWeatherHook {
                 logInfo("Hooked UserPreferences." + setWeatherMethod + " & " + getWeatherMethod + " for weatherDataClass=" + weatherDataClass.getName());
             }
 
-            // Hook WeatherSync singleton (Lif8.j/l in v24.1.1, Llf8/Lif8.i/k in v24.0.3)
-            for (String syncClassName : new String[]{"if8", "lf8"}) {
+            // Hook WeatherSync singleton (auto-resolved or Lif8/Llf8 fallback)
+            String autoSyncCls = sAutoTargets != null ? sAutoTargets.weatherSyncClass : null;
+            for (String syncClassName : new String[]{autoSyncCls, "if8", "lf8"}) {
+                if (syncClassName == null || syncClassName.isEmpty()) continue;
                 Class<?> syncCand = findClassSafe(cl, syncClassName);
-                String syncTriggerMethod = hasMethod(syncCand, "l", Context.class, boolean.class) ? "l"
-                        : (hasMethod(syncCand, "k", Context.class, boolean.class) ? "k" : null);
+                String autoTrig = sAutoTargets != null ? sAutoTargets.weatherTriggerMethod : null;
+                String syncTriggerMethod = (autoTrig != null && hasMethod(syncCand, autoTrig, Context.class, boolean.class)) ? autoTrig
+                        : (hasMethod(syncCand, "l", Context.class, boolean.class) ? "l"
+                        : (hasMethod(syncCand, "k", Context.class, boolean.class) ? "k" : null));
                 if (syncCand != null && syncTriggerMethod != null) {
                     // Prevent Endpoint 14 .o() from triggering a re-entrant weather sync mid-BLE-HTTP-transfer!
-                    String needSyncMethod = (userPrefsClass != null && hasMethodWithReturn(syncCand, "j", boolean.class, userPrefsClass)) ? "j"
-                            : ((userPrefsClass != null && hasMethodWithReturn(syncCand, "i", boolean.class, userPrefsClass)) ? "i" : null);
+                    String autoNeed = sAutoTargets != null ? sAutoTargets.weatherNeedSyncMethod : null;
+                    String needSyncMethod = (userPrefsClass != null && autoNeed != null && hasMethodWithReturn(syncCand, autoNeed, boolean.class, userPrefsClass)) ? autoNeed
+                            : ((userPrefsClass != null && hasMethodWithReturn(syncCand, "j", boolean.class, userPrefsClass)) ? "j"
+                            : ((userPrefsClass != null && hasMethodWithReturn(syncCand, "i", boolean.class, userPrefsClass)) ? "i" : null));
                     if (needSyncMethod != null) {
                         HookBridge.findAndHookMethod(syncCand, needSyncMethod, userPrefsClass, new HookBridge.MethodHook() {
                             @Override
@@ -1060,7 +1173,7 @@ public class NotifyWeatherHook {
     private void hookKl5PlaceModel(final ClassLoader cl) {
         try {
             Class<?> userPrefsClass = findClassSafe(cl, "com.mc.miband1.model.UserPreferences");
-            Class<?> placeClass = findClassSafe(cl, "ll5", "nl5", "kl5");
+            Class<?> placeClass = resolveTargetClass(cl, sAutoTargets != null ? sAutoTargets.placeModelClass : null, "ll5", "nl5", "fl5", "kl5");
             if (placeClass == null || userPrefsClass == null) {
                 logError("Could not find Lll5/Lnl5 place model class", null);
                 return;
@@ -1123,7 +1236,9 @@ public class NotifyWeatherHook {
     private void hookBleWeatherEndpoint14(final ClassLoader cl) {
         try {
             Class<?> ep14Class = null;
-            for (String candName : new String[]{"kf8", "nf8", "ud8", "tc8"}) {
+            String autoEp14 = sAutoTargets != null ? sAutoTargets.endpoint14Class : null;
+            for (String candName : new String[]{autoEp14, "kf8", "nf8", "jf8", "ud8", "tc8"}) {
+                if (candName == null || candName.isEmpty()) continue;
                 Class<?> c = findClassSafe(cl, candName);
                 if (c != null && hasMethod(c, "w") && hasMethod(c, "v") && hasMethod(c, "j") && hasMethod(c, "l")) {
                     ep14Class = c;
@@ -1328,8 +1443,11 @@ public class NotifyWeatherHook {
 
             // 4.9 Hook o(BLEManager, String, HashMap) -> Inject "place" JSON into /weather/v6/ response & fix CBOR /weather/v5/
             Class<?> bleManagerClass = findClassSafe(cl, "com.mc.miband1.bluetooth.BLEManager", "com.mc.miband1.ble.BLEManager");
-            if (bleManagerClass != null && hasMethod(ep14Class, "o", bleManagerClass, String.class, HashMap.class)) {
-                HookBridge.findAndHookMethod(ep14Class, "o", bleManagerClass, String.class, HashMap.class, new HookBridge.MethodHook() {
+            String ep14HttpMethod = (sAutoTargets != null && sAutoTargets.endpoint14HttpMethod != null
+                    && bleManagerClass != null && hasMethod(ep14Class, sAutoTargets.endpoint14HttpMethod, bleManagerClass, String.class, HashMap.class))
+                    ? sAutoTargets.endpoint14HttpMethod : "o";
+            if (bleManagerClass != null && hasMethod(ep14Class, ep14HttpMethod, bleManagerClass, String.class, HashMap.class)) {
+                HookBridge.findAndHookMethod(ep14Class, ep14HttpMethod, bleManagerClass, String.class, HashMap.class, new HookBridge.MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         if (!isWeatherFixEnabled(cl)) return;
@@ -1382,7 +1500,7 @@ public class NotifyWeatherHook {
                                     sActiveWatchLocationKey = reqKey;
                                 }
                             }
-                            Class<?> v6WrapperClass = findClassSafe(cl, "v86", "a96", "y86", "y76");
+                            Class<?> v6WrapperClass = resolveTargetClass(cl, sAutoTargets != null ? sAutoTargets.v6WrapperClass : null, "v86", "a96", "r86", "y86", "y76");
                             if (v6WrapperClass != null && v6WrapperClass.isInstance(respWrapper)) {
                                 Object placeJson = buildPlaceJson(prefs, cl);
                                 if (placeJson != null) {
@@ -1501,7 +1619,8 @@ public class NotifyWeatherHook {
                     || (initBId != null && !targetAutoId.equals(initBId)));
             sActiveWatchLocationKey = targetAutoId;
 
-            Class<?> fc2Class = findClassSafe(cl, "ac2", "fc2", "cc2");
+            Class<?> fc2Class = resolveTargetClass(cl, sAutoTargets != null ? sAutoTargets.bleRawSenderClass : null, "ac2", "gc2", "fc2", "cc2");
+            String rawSendMethod = (sAutoTargets != null && sAutoTargets.bleRawSenderMethod != null) ? sAutoTargets.bleRawSenderMethod : "g";
             if (bleMgr != null && fc2Class != null) {
                 try {
                     if (needForcePlaceRefresh) {
@@ -1517,7 +1636,7 @@ public class NotifyWeatherHook {
                         farBuf.putLong(nowMs - 1000L);
                         farBuf.putInt(latInt + 150000);
                         farBuf.putInt(lonInt + 150000);
-                        HookBridge.callStaticMethod(fc2Class, "g", bleMgr, 49, null, farBuf.array(), false);
+                        HookBridge.callStaticMethod(fc2Class, rawSendMethod, bleMgr, 49, null, farBuf.array(), false);
                         Thread.sleep(150L);
                     }
 
@@ -1531,7 +1650,7 @@ public class NotifyWeatherHook {
                     vsBuf.putInt(lonInt);   // longitude * 3,000,000 (4B LE)
                     byte[] vsPayload = vsBuf.array();
 
-                    Object vsRes = HookBridge.callStaticMethod(fc2Class, "g", bleMgr, 49, null, vsPayload, false);
+                    Object vsRes = HookBridge.callStaticMethod(fc2Class, rawSendMethod, bleMgr, 49, null, vsPayload, false);
                     logInfo("[SingleCitySync] Sent Endpoint 49 (VirtualSensor) GNSS location packet (forceRefresh="
                             + needForcePlaceRefresh + ") -> latInt=" + latInt
                             + ", lonInt=" + lonInt + ", targetAutoId='" + targetAutoId + "', res=" + vsRes);
@@ -1608,7 +1727,7 @@ public class NotifyWeatherHook {
             if (!isHttpProxyBusyOrRecent(5000L)) {
                 try {
                     if (bleMgr != null && fc2Class != null) {
-                        Object res = HookBridge.callStaticMethod(fc2Class, "g", bleMgr, 1, null, new byte[]{0x12, 0x00}, false);
+                        Object res = HookBridge.callStaticMethod(fc2Class, rawSendMethod, bleMgr, 1, null, new byte[]{0x12, 0x00}, false);
                         logInfo("[SingleCitySync] Sent [0x12, 0x00] on Endpoint 1 (bleMgr=" + bleMgr.getClass().getSimpleName() + ") -> " + res);
                     } else {
                         logError("[SingleCitySync] Cannot send [0x12, 0x00]: bleMgr=" + bleMgr + ", fc2Class=" + fc2Class, null);
@@ -1741,32 +1860,39 @@ public class NotifyWeatherHook {
         try {
             Class<?> userPrefsClass = findClassSafe(cl, "com.mc.miband1.model.UserPreferences");
             Class<?> weatherDataClass = resolveWeatherDataClass(cl);
-            Class<?> u51Class = findClassSafe(cl, "v51", "u51");
-            Class<?> builderClass = findClassSafe(cl, "q38", "z38", "mh7", "lg7");
+            Class<?> u51Class = resolveTargetClass(cl, sAutoTargets != null ? sAutoTargets.dailyWeatherU51Class : null, "v51", "u51");
+            Class<?> builderClass = resolveTargetClass(cl, sAutoTargets != null ? sAutoTargets.placeJsonBuilderClass : null, "q38", "z38", "wf", "mh7", "lg7");
 
             if (builderClass == null || userPrefsClass == null) {
-                logError("Could not find Weather v6 JSON Builder class (q38/z38/mh7)", null);
+                logError("Could not find Weather v6 JSON Builder class (q38/z38/wf/mh7)", null);
                 return;
             }
 
-            // 6.1 Hook place JSON builder: D(UserPreferences, String) in Lq38 (v24.1.1), E(UserPreferences) in Lz38, t(UserPreferences) in Lmh7
+            // 6.1 Hook place JSON builder: auto-resolved or D(UserPreferences, String) / E / t
+            String autoPlaceMethod = sAutoTargets != null ? sAutoTargets.placeJsonMethod : null;
             String placeMethodName = null;
-            if (hasMethod(builderClass, "D", userPrefsClass, String.class)) {
+            if (autoPlaceMethod != null && hasMethod(builderClass, autoPlaceMethod, userPrefsClass, String.class)) {
+                placeMethodName = autoPlaceMethod;
+            } else if (hasMethod(builderClass, "D", userPrefsClass, String.class)) {
                 placeMethodName = "D";
-                HookBridge.findAndHookMethod(builderClass, "D", userPrefsClass, String.class, new HookBridge.MethodHook() {
+            }
+            if (placeMethodName != null) {
+                final String pm2 = placeMethodName;
+                HookBridge.findAndHookMethod(builderClass, placeMethodName, userPrefsClass, String.class, new HookBridge.MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
                         if (!isWeatherFixEnabled(cl)) return;
                         Object place = buildPlaceJson(param.args[0], cl);
                         if (place != null) {
                             param.setResult(place);
-                            logInfo("[" + builderClass.getSimpleName() + ".D] Built place JSON: " + place);
+                            logInfo("[" + builderClass.getSimpleName() + "." + pm2 + "] Built place JSON: " + place);
                         }
                     }
                 });
             } else {
-                placeMethodName = hasMethod(builderClass, "E", userPrefsClass) ? "E"
-                        : (hasMethod(builderClass, "t", userPrefsClass) ? "t" : null);
+                placeMethodName = (autoPlaceMethod != null && hasMethod(builderClass, autoPlaceMethod, userPrefsClass)) ? autoPlaceMethod
+                        : (hasMethod(builderClass, "E", userPrefsClass) ? "E"
+                        : (hasMethod(builderClass, "t", userPrefsClass) ? "t" : null));
                 if (placeMethodName != null) {
                     final String pm = placeMethodName;
                     HookBridge.findAndHookMethod(builderClass, placeMethodName, userPrefsClass, new HookBridge.MethodHook() {
@@ -1829,12 +1955,15 @@ public class NotifyWeatherHook {
                 }
             }
 
-            // 6.3 Hook single-hour fallback builder: h(UserPreferences, Lv51, Lof8, double, long) in Lq38, i in Lz38, f in Lmh7
-            Class<?> rf8Class = findClassSafe(cl, "of8", "rf8");
+            // 6.3 Hook single-hour fallback builder: auto-resolved or h/i/g/f(UserPreferences, u51, rf8, double, long)
+            Class<?> rf8Class = resolveTargetClass(cl, sAutoTargets != null ? sAutoTargets.weatherHelperRf8Class : null, "of8", "rf8", "nf8");
             if (u51Class != null && rf8Class != null) {
-                String fallbackHourMethod = hasMethod(builderClass, "h", userPrefsClass, u51Class, rf8Class, double.class, long.class) ? "h"
+                String autoFallback = sAutoTargets != null ? sAutoTargets.fallbackHourMethod : null;
+                String fallbackHourMethod = (autoFallback != null && hasMethod(builderClass, autoFallback, userPrefsClass, u51Class, rf8Class, double.class, long.class)) ? autoFallback
+                        : (hasMethod(builderClass, "h", userPrefsClass, u51Class, rf8Class, double.class, long.class) ? "h"
                         : (hasMethod(builderClass, "i", userPrefsClass, u51Class, rf8Class, double.class, long.class) ? "i"
-                        : (hasMethod(builderClass, "f", userPrefsClass, u51Class, rf8Class, double.class, long.class) ? "f" : null));
+                        : (hasMethod(builderClass, "g", userPrefsClass, u51Class, rf8Class, double.class, long.class) ? "g"
+                        : (hasMethod(builderClass, "f", userPrefsClass, u51Class, rf8Class, double.class, long.class) ? "f" : null))));
                 if (fallbackHourMethod != null) {
                     HookBridge.findAndHookMethod(builderClass, fallbackHourMethod,
                             userPrefsClass, u51Class, rf8Class, double.class, long.class, new HookBridge.MethodHook() {
@@ -1936,12 +2065,12 @@ public class NotifyWeatherHook {
     // =========================================================================
     private void hookBleHttpProxy(final ClassLoader cl) {
         try {
-            Class<?> proxyClass = findClassSafe(cl, "zu5", "ev5", "cv5");
+            Class<?> proxyClass = resolveTargetClass(cl, sAutoTargets != null ? sAutoTargets.bleHttpProxyClass : null, "zu5", "ev5", "wu5", "cv5");
             if (proxyClass == null) {
-                logError("Could not find BLE HTTP Proxy class (zu5/ev5/cv5)", null);
+                logError("Could not find BLE HTTP Proxy class (zu5/ev5/wu5/cv5)", null);
                 return;
             }
-            Class<?> xpClass = findClassSafe(cl, "xp");
+            Class<?> xpClass = resolveTargetClass(cl, sAutoTargets != null ? sAutoTargets.bleDevicePacketClass : null, "xp");
             if (xpClass != null && hasMethod(proxyClass, "f", xpClass, int.class, byte[].class)) {
                 HookBridge.findAndHookMethod(proxyClass, "f", xpClass, int.class, byte[].class, new HookBridge.MethodHook() {
                     @Override
@@ -1992,7 +2121,7 @@ public class NotifyWeatherHook {
                 });
                 logInfo("Hooked BLE HTTP Proxy response sender: " + proxyClass.getName() + "." + respSendMethod + "(int, int, byte[])");
             } else {
-                Class<?> respClass = findClassSafe(cl, "n86", "s86", "q86");
+                Class<?> respClass = resolveTargetClass(cl, sAutoTargets != null ? sAutoTargets.httpRespClass : null, "n86", "s86", "j86", "q86");
                 if (respClass != null && hasMethod(proxyClass, "m", respClass)) {
                     HookBridge.findAndHookMethod(proxyClass, "m", respClass, new HookBridge.MethodHook() {
                         @Override
@@ -2086,12 +2215,15 @@ public class NotifyWeatherHook {
     // =========================================================================
     private void hookBroadcastFailureOverride(final ClassLoader cl) {
         try {
-            Class<?> dispatcherClass = findClassSafe(cl, "v38", "e48", "b48");
+            Class<?> dispatcherClass = resolveTargetClass(cl, sAutoTargets != null ? sAutoTargets.localBroadcastClass : null, "v38", "w38", "e48", "b48");
             if (dispatcherClass == null) return;
 
             // Convert weatherUpdateFailed into weatherUpdated when our custom sync succeeded
-            String strBroadcastMethod = hasMethod(dispatcherClass, "h2", Context.class, String.class) ? "h2"
-                    : (hasMethod(dispatcherClass, "r2", Context.class, String.class) ? "r2" : null);
+            String autoBm = sAutoTargets != null ? sAutoTargets.localBroadcastMethod : null;
+            String strBroadcastMethod = (autoBm != null && hasMethod(dispatcherClass, autoBm, Context.class, String.class)) ? autoBm
+                    : (hasMethod(dispatcherClass, "h2", Context.class, String.class) ? "h2"
+                    : (hasMethod(dispatcherClass, "r2", Context.class, String.class) ? "r2"
+                    : (hasMethod(dispatcherClass, "s2", Context.class, String.class) ? "s2" : null)));
             if (strBroadcastMethod != null) {
                 final String bm = strBroadcastMethod;
                 HookBridge.findAndHookMethod(dispatcherClass, strBroadcastMethod, Context.class, String.class, new HookBridge.MethodHook() {
@@ -2335,12 +2467,22 @@ public class NotifyWeatherHook {
                 });
             }
 
-            // 2. Hook Lmj4.b (v24.1.1) or Llj4.d (v24.0.3) in UpdateFirmwareActivity so ProgressDialog R updates 0%->100% and dismisses cleanly
-            Class<?> fwRecvClass = findClassSafe(cl, "mj4", "lj4");
+            // 2. Hook auto-resolved fwRecvClass (Lmj4.b / Llj4.d) in UpdateFirmwareActivity so ProgressDialog R updates 0%->100% and dismisses cleanly
+            Class<?> fwRecvClass = resolveTargetClass(cl, sAutoTargets != null ? sAutoTargets.fwRecvClass : null, "mj4", "lj4");
             String fwRecvMethod = (fwRecvClass != null && hasMethod(fwRecvClass, "b", Context.class, Intent.class)) ? "b"
                     : ((fwRecvClass != null && hasMethod(fwRecvClass, "d", Context.class, Intent.class)) ? "d" : null);
             if (fwRecvClass != null && fwRecvMethod != null) {
-                final String targetFieldName = "mj4".equals(fwRecvClass.getSimpleName()) ? "b" : "c";
+                String resolvedTargetField = "mj4".equals(fwRecvClass.getSimpleName()) ? "b" : "c";
+                try {
+                    for (Field f : fwRecvClass.getDeclaredFields()) {
+                        if (f.getType() == Object.class) {
+                            resolvedTargetField = f.getName();
+                            break;
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+                final String targetFieldName = resolvedTargetField;
                 HookBridge.findAndHookMethod(fwRecvClass, fwRecvMethod, Context.class, Intent.class, new HookBridge.MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
@@ -2379,10 +2521,12 @@ public class NotifyWeatherHook {
                 logInfo("Hooked UpdateFirmwareActivity receiver: " + fwRecvClass.getName() + "." + fwRecvMethod + "(Context, Intent)");
             }
 
-            // 3. Hook Lsv.c(Context) [v24.1.1] or Luv.d(Context) [v24.0.3] -> Prepare valid Zepp OS 6 UIHH (EPO/LTO)
-            final Class<?> uvClass = findClassSafe(cl, "sv", "uv");
-            String agpsPackMethod = (uvClass != null && hasMethodWithReturn(uvClass, "c", java.io.File.class, Context.class)) ? "c"
-                    : ((uvClass != null && hasMethodWithReturn(uvClass, "d", java.io.File.class, Context.class)) ? "d" : null);
+            // 3. Hook auto-resolved agpsPackerClass (Lsv.c / Luv.d) -> Prepare valid Zepp OS 6 UIHH (EPO/LTO)
+            final Class<?> uvClass = resolveTargetClass(cl, sAutoTargets != null ? sAutoTargets.agpsPackerClass : null, "sv", "uv");
+            String autoPackM = sAutoTargets != null ? sAutoTargets.agpsPackMethod : null;
+            String agpsPackMethod = (uvClass != null && autoPackM != null && hasMethodWithReturn(uvClass, autoPackM, java.io.File.class, Context.class)) ? autoPackM
+                    : ((uvClass != null && hasMethodWithReturn(uvClass, "c", java.io.File.class, Context.class)) ? "c"
+                    : ((uvClass != null && hasMethodWithReturn(uvClass, "d", java.io.File.class, Context.class)) ? "d" : null));
             if (uvClass != null && agpsPackMethod != null) {
                 final String pm = agpsPackMethod;
                 HookBridge.findAndHookMethod(uvClass, agpsPackMethod, Context.class, new HookBridge.MethodHook() {
@@ -2412,11 +2556,13 @@ public class NotifyWeatherHook {
                 logInfo("Hooked " + uvClass.getName() + "." + agpsPackMethod + "(Context) for Zepp OS 6 LTO/EPO UIHH packaging");
             }
 
-            // 4. Hook Lsv.h [v24.1.1] or Luv.i [v24.0.3] (BLEManager, File, Ls6) to request HIGH connection priority, log MTU, and track progress
+            // 4. Hook auto-resolved agpsPackerClass.<sendMethod> (BLEManager, File, s6) to request HIGH connection priority, log MTU, and track progress
             Class<?> bleMgrClass = findClassSafe(cl, "com.mc.miband1.bluetooth.BLEManager");
-            Class<?> s6Class = findClassSafe(cl, "s6");
-            String agpsSendMethod = (uvClass != null && bleMgrClass != null && s6Class != null && hasMethod(uvClass, "h", bleMgrClass, java.io.File.class, s6Class)) ? "h"
-                    : ((uvClass != null && bleMgrClass != null && s6Class != null && hasMethod(uvClass, "i", bleMgrClass, java.io.File.class, s6Class)) ? "i" : null);
+            Class<?> s6Class = resolveTargetClass(cl, sAutoTargets != null ? sAutoTargets.agpsEndpointS6Class : null, "s6");
+            String autoSendM = sAutoTargets != null ? sAutoTargets.agpsSendMethod : null;
+            String agpsSendMethod = (uvClass != null && bleMgrClass != null && s6Class != null && autoSendM != null && hasMethod(uvClass, autoSendM, bleMgrClass, java.io.File.class, s6Class)) ? autoSendM
+                    : ((uvClass != null && bleMgrClass != null && s6Class != null && hasMethod(uvClass, "h", bleMgrClass, java.io.File.class, s6Class)) ? "h"
+                    : ((uvClass != null && bleMgrClass != null && s6Class != null && hasMethod(uvClass, "i", bleMgrClass, java.io.File.class, s6Class)) ? "i" : null));
             if (uvClass != null && agpsSendMethod != null) {
                 final String sm = agpsSendMethod;
                 HookBridge.findAndHookMethod(uvClass, agpsSendMethod, bleMgrClass, java.io.File.class, s6Class, new HookBridge.MethodHook() {
@@ -2487,8 +2633,10 @@ public class NotifyWeatherHook {
                             android.bluetooth.BluetoothGattCharacteristic ch = (android.bluetooth.BluetoothGattCharacteristic) param.args[0];
                             if (ch != null && ch.getUuid() != null) {
                                 String u = ch.getUuid().toString();
-                                if (u.startsWith("00000023-") || u.startsWith("00000024-")
-                                        || u.startsWith("00000016-") || u.startsWith("00000017-")) {
+                                // Only force mode=2 (zero 600ms sleep) on Zepp OS 6 bulk file transfer characteristics (Lgt8.a/b = 00000023/00000024).
+                                // Do NOT force mode=2 on 00000016/00000017 (encrypted control channel used by Endpoint 0x42 [0x03,len] at 12% and Endpoint 0xA0 HA bridge),
+                                // because mode=2 bypasses J1 lock and sets a 40ms timeout that causes intermittent stalls before CONNECTION_PRIORITY_HIGH!
+                                if (u.startsWith("00000023-") || u.startsWith("00000024-")) {
                                     int origMode = (Integer) param.args[2];
                                     int props = ch.getProperties();
                                     boolean supportsNoResp = (props & android.bluetooth.BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0;
@@ -2515,13 +2663,13 @@ public class NotifyWeatherHook {
                 logInfo("Hooked BLEManager." + bleWriteMethod + " to use mode=2 (zero 600ms sleep) + WRITE_TYPE_NO_RESPONSE on Zepp OS 6 file transfer characteristics");
             }
 
-            // 4b-2. Hook Lvn7.l(long) [v24.1.1] / Lqn7.l(long) [v24.0.3] so mode=2's 40ms ConditionVariable timeout won't abort under brief BLE jitter
-            Class<?> qn7Class = findClassSafe(cl, "vn7", "qn7");
+            // 4b-2. Hook auto-resolved agpsWaitQn7Class (Lvn7 / Lqn7).l(long) so mode=2's 40ms ConditionVariable timeout won't abort under brief BLE jitter
+            Class<?> qn7Class = resolveTargetClass(cl, sAutoTargets != null ? sAutoTargets.agpsWaitQn7Class : null, "vn7", "qn7");
             if (qn7Class != null && hasMethod(qn7Class, "l", long.class)) {
                 HookBridge.findAndHookMethod(qn7Class, "l", long.class, new HookBridge.MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
-                        if (!isAgpsFixEnabled(cl) || !sAgpsTransferActive) return;
+                        if (!isAgpsFixEnabled(cl)) return;
                         long timeoutMs = (Long) param.args[0];
                         if (timeoutMs > 0L && timeoutMs <= 100L) {
                             param.args[0] = 3000L;
@@ -2531,8 +2679,8 @@ public class NotifyWeatherHook {
                 logInfo("Hooked " + qn7Class.getName() + ".l(long) to relax 40ms fast-write timeout to 3000ms safety ceiling");
             }
 
-            // 4c. Hook Lou8.j(), Lou8.c(UUID, byte[]), and Lmu8.run() to prevent Main Thread monitor contention and premature 5s chunk timeout
-            Class<?> ou8Class = findClassSafe(cl, "ou8");
+            // 4c. Hook auto-resolved ou8 / mu8 to prevent Main Thread monitor contention and premature 5s chunk timeout
+            Class<?> ou8Class = resolveTargetClass(cl, sAutoTargets != null ? sAutoTargets.agpsTransferOu8Class : null, "ou8");
             // v24.1.1 Lou8: active transfer = field g (Lp22), last timestamp = field i (long)
             // v24.0.3 Lou8: active transfer = field h (Lu22), last timestamp = field j (long)
             String resolvedTsField = "j";
@@ -2579,7 +2727,7 @@ public class NotifyWeatherHook {
                     });
                 }
             }
-            Class<?> mu8Class = findClassSafe(cl, "mu8");
+            Class<?> mu8Class = resolveTargetClass(cl, sAutoTargets != null ? sAutoTargets.agpsTimeoutMu8Class : null, "mu8");
             if (mu8Class != null && hasMethod(mu8Class, "run")) {
                 HookBridge.findAndHookMethod(mu8Class, "run", new HookBridge.MethodHook() {
                     @Override
@@ -2612,8 +2760,8 @@ public class NotifyWeatherHook {
                 });
             }
 
-            // 5. Hook Lku8.q(int) and Lku8.l(boolean) -> Real-time BLE transfer progress + completion/timeout handling
-            Class<?> ku8Class = findClassSafe(cl, "ku8");
+            // 5. Hook auto-resolved ku8.q(int) and ku8.l(boolean) -> Real-time BLE transfer progress + completion/timeout handling
+            Class<?> ku8Class = resolveTargetClass(cl, sAutoTargets != null ? sAutoTargets.agpsProgressKu8Class : null, "ku8");
             if (ku8Class != null) {
                 if (hasMethod(ku8Class, "q", int.class)) {
                     HookBridge.findAndHookMethod(ku8Class, "q", int.class, new HookBridge.MethodHook() {
@@ -2640,8 +2788,12 @@ public class NotifyWeatherHook {
                     });
                 }
 
-                if (hasMethod(ku8Class, "l", boolean.class)) {
-                    HookBridge.findAndHookMethod(ku8Class, "l", boolean.class, new HookBridge.MethodHook() {
+                String ku8DoneM = (sAutoTargets != null && sAutoTargets.agpsProgressDoneMethod != null
+                        && hasMethod(ku8Class, sAutoTargets.agpsProgressDoneMethod, boolean.class))
+                        ? sAutoTargets.agpsProgressDoneMethod
+                        : (hasMethod(ku8Class, "l", boolean.class) ? "l" : null);
+                if (ku8DoneM != null) {
+                    HookBridge.findAndHookMethod(ku8Class, ku8DoneM, boolean.class, new HookBridge.MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
                             if (!isAgpsFixEnabled(cl)) return;
@@ -2729,7 +2881,7 @@ public class NotifyWeatherHook {
             }
 
             // 6. Hook Ls6.f(Lxp, int, byte[]) on Endpoint 0x42 to observe watch AGPS install status
-            Class<?> xpClass = findClassSafe(cl, "xp");
+            Class<?> xpClass = resolveTargetClass(cl, sAutoTargets != null ? sAutoTargets.bleDevicePacketClass : null, "xp");
             if (s6Class != null && xpClass != null && hasMethod(s6Class, "f", xpClass, int.class, byte[].class)) {
                 HookBridge.findAndHookMethod(s6Class, "f", xpClass, int.class, byte[].class, new HookBridge.MethodHook() {
                     @Override
@@ -2777,8 +2929,8 @@ public class NotifyWeatherHook {
                 });
             }
 
-            // 7. Hook Lbn6.f [v24.1.1] / Lxm6.f [v24.0.3] (Lxp, int, byte[]) on Endpoint 0x0a to parse watch AGPS status response
-            Class<?> xm6Class = findClassSafe(cl, "bn6", "xm6");
+            // 7. Hook auto-resolved xm6/bn6.f(Lxp, int, byte[]) on Endpoint 0x0a to parse watch AGPS status response
+            Class<?> xm6Class = resolveTargetClass(cl, sAutoTargets != null ? sAutoTargets.agpsCapXm6Class : null, "bn6", "xm6");
             if (xm6Class != null && xpClass != null && hasMethod(xm6Class, "f", xpClass, int.class, byte[].class)) {
                 HookBridge.findAndHookMethod(xm6Class, "f", xpClass, int.class, byte[].class, new HookBridge.MethodHook() {
                     @Override
@@ -2872,23 +3024,99 @@ public class NotifyWeatherHook {
         return sb.toString();
     }
 
+    private static boolean dispatchNotifyInternalIntent(Context ctx, ClassLoader cl,
+                                                        String uuidAction, String legacyAction,
+                                                        String uuidExtraKey, String legacyExtraKey,
+                                                        int intExtraVal, android.net.Uri firmwareFileUri) {
+        if (ctx == null) ctx = sAppContext;
+        if (ctx == null) return false;
+        String autoCls = sAutoTargets != null ? sAutoTargets.localBroadcastClass : null;
+        String autoIntentM = sAutoTargets != null ? sAutoTargets.localBroadcastIntentMethod : null;
+        String autoSendM = sAutoTargets != null ? sAutoTargets.localBroadcastSendIntentMethod : null;
+        String[] candidates = new String[]{autoCls, "v38", "w38", "s28", "e48", "b48"};
+        for (String name : candidates) {
+            if (name == null || name.isEmpty()) continue;
+            Class<?> cls = HookBridge.findClassIfExists(name, cl);
+            if (cls == null) continue;
+            String intentM = null;
+            String sendM = null;
+            boolean useUuid = true;
+            if (autoIntentM != null && autoSendM != null
+                    && hasMethodWithReturn(cls, autoIntentM, Intent.class, String.class)
+                    && hasMethod(cls, autoSendM, Context.class, Intent.class)) {
+                intentM = autoIntentM;
+                sendM = autoSendM;
+                useUuid = !"r0".equals(autoIntentM);
+            } else if (hasMethodWithReturn(cls, "k0", Intent.class, String.class)
+                    && hasMethod(cls, "g2", Context.class, Intent.class)) {
+                intentM = "k0";
+                sendM = "g2";
+                useUuid = true;
+            } else if (hasMethodWithReturn(cls, "r0", Intent.class, String.class)
+                    && hasMethod(cls, "r2", Context.class, Intent.class)) {
+                intentM = "r0";
+                sendM = "r2";
+                useUuid = false;
+            } else if (hasMethodWithReturn(cls, "j0", Intent.class, String.class)
+                    && hasMethod(cls, "e2", Context.class, Intent.class)) {
+                intentM = "j0";
+                sendM = "e2";
+                useUuid = true;
+            }
+            if (intentM != null && sendM != null) {
+                try {
+                    String action = useUuid ? uuidAction : legacyAction;
+                    Intent intent = (Intent) HookBridge.callStaticMethod(cls, intentM, action);
+                    if (firmwareFileUri != null) {
+                        intent.putExtra("firmwareFile", firmwareFileUri);
+                    }
+                    String extraKey = useUuid ? uuidExtraKey : legacyExtraKey;
+                    if (extraKey != null) {
+                        intent.putExtra(extraKey, intExtraVal);
+                    }
+                    HookBridge.callStaticMethod(cls, sendM, ctx.getApplicationContext(), intent);
+                    logInfo("[InternalBroadcast] Dispatched '" + action + "' via " + cls.getName() + "." + sendM);
+                    return true;
+                } catch (Throwable t) {
+                    logError("[InternalBroadcast] Failed via " + cls.getName() + "." + sendM, t);
+                }
+            }
+        }
+        return false;
+    }
+
     private static void broadcastFirmwareKo(Context ctx, ClassLoader cl) {
         if (ctx == null) ctx = sAppContext;
         if (ctx == null) return;
         try {
-            Class<?> v38Class = findClassSafe(cl, "v38");
-            if (v38Class != null && hasMethod(v38Class, "h2", Context.class, String.class)) {
-                HookBridge.callStaticMethod(v38Class, "h2", ctx.getApplicationContext(), ACTION_NOTIFY_FW_KO_UUID);
-                return;
+            String autoCls = sAutoTargets != null ? sAutoTargets.localBroadcastClass : null;
+            String autoBm = sAutoTargets != null ? sAutoTargets.localBroadcastMethod : null;
+            String[] candidates = new String[]{autoCls, "v38", "w38", "s28", "e48", "b48"};
+            for (String name : candidates) {
+                if (name == null || name.isEmpty()) continue;
+                Class<?> cls = HookBridge.findClassIfExists(name, cl);
+                if (cls == null) continue;
+                if (autoBm != null && hasMethod(cls, autoBm, Context.class, String.class)) {
+                    String action = "s2".equals(autoBm) ? "com.mc.miband.firmwareKO" : ACTION_NOTIFY_FW_KO_UUID;
+                    HookBridge.callStaticMethod(cls, autoBm, ctx.getApplicationContext(), action);
+                    return;
+                }
+                if (hasMethod(cls, "h2", Context.class, String.class)) {
+                    HookBridge.callStaticMethod(cls, "h2", ctx.getApplicationContext(), ACTION_NOTIFY_FW_KO_UUID);
+                    return;
+                }
+                if (hasMethod(cls, "s2", Context.class, String.class)) {
+                    HookBridge.callStaticMethod(cls, "s2", ctx.getApplicationContext(), "com.mc.miband.firmwareKO");
+                    return;
+                }
+                if (hasMethod(cls, "f2", Context.class, String.class)) {
+                    HookBridge.callStaticMethod(cls, "f2", ctx.getApplicationContext(), ACTION_NOTIFY_FW_KO_UUID);
+                    return;
+                }
             }
-            Class<?> w38Class = findClassSafe(cl, "w38", "e48", "b48");
-            if (w38Class != null && hasMethod(w38Class, "s2", Context.class, String.class)) {
-                HookBridge.callStaticMethod(w38Class, "s2", ctx.getApplicationContext(), "com.mc.miband.firmwareKO");
-            } else {
-                Intent ko = new Intent(ACTION_NOTIFY_FW_KO_UUID);
-                ko.setPackage(TARGET_PACKAGE);
-                ctx.sendBroadcast(ko);
-            }
+            Intent ko = new Intent(ACTION_NOTIFY_FW_KO_UUID);
+            ko.setPackage(TARGET_PACKAGE);
+            ctx.sendBroadcast(ko);
         } catch (Throwable ignored) {
         }
     }
@@ -2899,21 +3127,8 @@ public class NotifyWeatherHook {
         try {
             // 1. Broadcast Notify's native progress intent so UpdateFirmwareActivity updates
             if (!done && pct >= 0) {
-                Class<?> v38Class = findClassSafe(cl, "v38");
-                if (v38Class != null && hasMethod(v38Class, "k0", String.class)
-                        && hasMethod(v38Class, "g2", Context.class, Intent.class)) {
-                    Intent progIntent = (Intent) HookBridge.callStaticMethod(v38Class, "k0", ACTION_NOTIFY_FW_PROGRESS_UUID);
-                    progIntent.putExtra("progress", pct);
-                    HookBridge.callStaticMethod(v38Class, "g2", ctx.getApplicationContext(), progIntent);
-                } else {
-                    Class<?> w38Class = findClassSafe(cl, "w38", "e48", "b48");
-                    if (w38Class != null && hasMethod(w38Class, "r0", String.class)
-                            && hasMethod(w38Class, "r2", Context.class, Intent.class)) {
-                        Intent progIntent = (Intent) HookBridge.callStaticMethod(w38Class, "r0", "com.mc.miband.firmware.progress");
-                        progIntent.putExtra("52dba2e7-52ff-4cfa-a5ac-e25c554ba544", pct);
-                        HookBridge.callStaticMethod(w38Class, "r2", ctx.getApplicationContext(), progIntent);
-                    }
-                }
+                dispatchNotifyInternalIntent(ctx, cl, ACTION_NOTIFY_FW_PROGRESS_UUID, "com.mc.miband.firmware.progress",
+                        "progress", "52dba2e7-52ff-4cfa-a5ac-e25c554ba544", pct, null);
             }
             // 2. Broadcast internal progress to Notify UI process (BandSettingsActivity)
             Intent internal = new Intent(ACTION_AGPS_INTERNAL_PROGRESS);
@@ -2945,7 +3160,7 @@ public class NotifyWeatherHook {
         // Also update Notify's own Lyx7/Lux7 AGPS timestamp key ("22d907dc-6606-4aac-ba8d-d6219402818e")
         if (ctx != null && cl != null) {
             try {
-                Class<?> ux7Class = findClassSafe(cl, "yx7", "ux7");
+                Class<?> ux7Class = resolveTargetClass(cl, sAutoTargets != null ? sAutoTargets.agpsTimeHelperClass : null, "yx7", "ux7");
                 if (ux7Class != null && hasMethod(ux7Class, "j", Context.class, String.class, long.class)) {
                     HookBridge.callStaticMethod(ux7Class, "j", ctx.getApplicationContext(), NOTIFY_AGPS_TIME_KEY, now);
                 }
@@ -3019,14 +3234,15 @@ public class NotifyWeatherHook {
     private static void queryWatchAgpsConfigOnEndpoint0A(ClassLoader cl) {
         try {
             Class<?> bleMgrClass = findClassSafe(cl, "com.mc.miband1.bluetooth.BLEManager");
-            Class<?> xm6Class = findClassSafe(cl, "bn6", "xm6");
-            Class<?> nv0Class = findClassSafe(cl, "mv0", "nv0");
+            Class<?> xm6Class = resolveTargetClass(cl, sAutoTargets != null ? sAutoTargets.agpsCapXm6Class : null, "bn6", "xm6");
+            Class<?> nv0Class = resolveTargetClass(cl, sAutoTargets != null ? sAutoTargets.agpsConfigGroupEnumClass : null, "mv0", "nv0");
+            String agpsEnumField = (sAutoTargets != null && sAutoTargets.agpsConfigGroupField != null) ? sAutoTargets.agpsConfigGroupField : "q";
             if (bleMgrClass != null && xm6Class != null && nv0Class != null) {
                 Object bleMgr = getBleManagerInstance(cl);
-                Object nv0Agps = HookBridge.getStaticObjectField(nv0Class, "q");
+                Object nv0Agps = HookBridge.getStaticObjectField(nv0Class, agpsEnumField);
                 if (bleMgr != null && nv0Agps != null && hasMethod(xm6Class, "k", bleMgrClass, nv0Class)) {
                     HookBridge.callStaticMethod(xm6Class, "k", bleMgr, nv0Agps);
-                    logInfo("[AGPS] Queried watch Endpoint 0x0A for AGPS config group (" + xm6Class.getSimpleName() + ".k / " + nv0Class.getSimpleName() + ".q)");
+                    logInfo("[AGPS] Queried watch Endpoint 0x0A for AGPS config group (" + xm6Class.getSimpleName() + ".k / " + nv0Class.getSimpleName() + "." + agpsEnumField + ")");
                 }
             }
         } catch (Throwable t) {
@@ -3227,17 +3443,20 @@ public class NotifyWeatherHook {
     }
 
     /**
-     * Builds the exact Huami/Zepp UIHH container (Lsx7) using Notify's Lqn0.c([B)I CRC32.
+     * Builds the exact Huami/Zepp UIHH container (Lsx7) using standard IEEE CRC32 (identical to Lqn0.c([B)I).
      */
+    private static int computeCrc32Int(byte[] data) {
+        java.util.zip.CRC32 crc32 = new java.util.zip.CRC32();
+        if (data != null) crc32.update(data);
+        return (int) crc32.getValue();
+    }
+
     private static byte[] buildUihhContainerBytes(ClassLoader cl, java.util.Map<Byte, byte[]> items) throws Exception {
-        Class<?> qn0Class = findClassSafe(cl, "qn0");
         java.io.ByteArrayOutputStream bodyStream = new java.io.ByteArrayOutputStream();
         for (java.util.Map.Entry<Byte, byte[]> entry : items.entrySet()) {
             byte tag = entry.getKey();
             byte[] payload = entry.getValue();
-            int crc = (qn0Class != null)
-                    ? (Integer) HookBridge.callStaticMethod(qn0Class, "c", (Object) payload)
-                    : 0;
+            int crc = computeCrc32Int(payload);
             java.nio.ByteBuffer itemHeader = java.nio.ByteBuffer.allocate(10).order(java.nio.ByteOrder.LITTLE_ENDIAN);
             itemHeader.put((byte) 0x01);
             itemHeader.put(tag);
@@ -3247,9 +3466,7 @@ public class NotifyWeatherHook {
             bodyStream.write(payload);
         }
         byte[] bodyBytes = bodyStream.toByteArray();
-        int bodyCrc = (qn0Class != null)
-                ? (Integer) HookBridge.callStaticMethod(qn0Class, "c", (Object) bodyBytes)
-                : 0;
+        int bodyCrc = computeCrc32Int(bodyBytes);
 
         java.nio.ByteBuffer header = java.nio.ByteBuffer.allocate(32).order(java.nio.ByteOrder.LITTLE_ENDIAN);
         header.put(new byte[]{0x55, 0x49, 0x48, 0x48}); // "UIHH"
@@ -3327,31 +3544,17 @@ public class NotifyWeatherHook {
                     ? (android.net.Uri) HookBridge.callStaticMethod(genericFpClass, "c", ctx.getApplicationContext(), uihFile)
                     : android.net.Uri.fromFile(uihFile);
 
-            Class<?> v38Class = findClassSafe(cl, "v38");
-            if (v38Class != null && hasMethod(v38Class, "k0", String.class)
-                    && hasMethod(v38Class, "g2", Context.class, Intent.class)) {
-                Intent agpsIntent = (Intent) HookBridge.callStaticMethod(v38Class, "k0", ACTION_NOTIFY_DO_AGPS_UUID);
-                agpsIntent.putExtra("firmwareFile", fileUri);
-                agpsIntent.putExtra("4436627f-408a-43f1-a12b-983c5b501c01", (mode == 2) ? 2 : 3);
-                HookBridge.callStaticMethod(v38Class, "g2", ctx.getApplicationContext(), agpsIntent);
-                logInfo("[OneClickAGPS] Dispatched AGPS update UUID via v38.g2 (uri=" + fileUri + ")");
-            } else {
-                Class<?> w38Class = findClassSafe(cl, "w38", "e48", "b48");
-                if (w38Class != null && hasMethod(w38Class, "r0", String.class)
-                        && hasMethod(w38Class, "r2", Context.class, Intent.class)) {
-                    Intent agpsIntent = (Intent) HookBridge.callStaticMethod(w38Class, "r0", "com.mc.miband.doAgpsUpdate");
-                    agpsIntent.putExtra("firmwareFile", fileUri);
-                    agpsIntent.putExtra("4436627f-408a-43f1-a12b-983c5b501c01", (mode == 2) ? 2 : 3);
-                    HookBridge.callStaticMethod(w38Class, "r2", ctx.getApplicationContext(), agpsIntent);
-                    logInfo("[OneClickAGPS] Dispatched com.mc.miband.doAgpsUpdate via " + w38Class.getName() + ".r2 (uri=" + fileUri + ")");
-                } else {
-                    Intent fallback = new Intent(ACTION_NOTIFY_DO_AGPS_UUID);
-                    fallback.setPackage(TARGET_PACKAGE);
-                    fallback.putExtra("firmwareFile", fileUri);
-                    fallback.putExtra("4436627f-408a-43f1-a12b-983c5b501c01", (mode == 2) ? 2 : 3);
-                    ctx.sendBroadcast(fallback);
-                    logInfo("[OneClickAGPS] Dispatched AGPS update UUID via standard broadcast");
-                }
+            boolean dispatched = dispatchNotifyInternalIntent(ctx, cl,
+                    ACTION_NOTIFY_DO_AGPS_UUID, "com.mc.miband.doAgpsUpdate",
+                    "4436627f-408a-43f1-a12b-983c5b501c01", "4436627f-408a-43f1-a12b-983c5b501c01",
+                    (mode == 2) ? 2 : 3, fileUri);
+            if (!dispatched) {
+                Intent fallback = new Intent(ACTION_NOTIFY_DO_AGPS_UUID);
+                fallback.setPackage(TARGET_PACKAGE);
+                fallback.putExtra("firmwareFile", fileUri);
+                fallback.putExtra("4436627f-408a-43f1-a12b-983c5b501c01", (mode == 2) ? 2 : 3);
+                ctx.sendBroadcast(fallback);
+                logInfo("[OneClickAGPS] Dispatched AGPS update UUID via standard broadcast fallback");
             }
         } catch (Throwable t) {
             logError("[OneClickAGPS] Failed to download/start AGPS update", t);
@@ -4772,8 +4975,8 @@ public class NotifyWeatherHook {
         try {
             Class<?> ns50Class = findClassSafe(cl, "com.mc.miband1.NotificationService50");
             resolveNotificationService50Fields(ns50Class);
-            Class<?> yf0Class = findClassSafe(cl, "zf0", "yf0");
-            Class<?> ba8Class = findClassSafe(cl, "ba8");
+            Class<?> yf0Class = resolveTargetClass(cl, sAutoTargets != null ? sAutoTargets.voipNotifyHelperClass : null, "zf0", "yf0");
+            Class<?> ba8Class = resolveTargetClass(cl, sAutoTargets != null ? sAutoTargets.voipBa8Class : null, "ba8");
             boolean isV2411Voip = (yf0Class != null && "zf0".equals(yf0Class.getSimpleName()))
                     || (ba8Class != null && ns50Class != null && hasMethod(ba8Class, "f", ns50Class, android.service.notification.StatusBarNotification.class));
 
@@ -4902,8 +5105,8 @@ public class NotifyWeatherHook {
             // NOTE: Endpoint 0x1E only carries 05 01 (Reject/Dismiss), 05 02 (Silence), 05 03 (SMS).
             // Do NOT mark sAnsweredFromWatch here; Watch Answer is strictly detected via HFP ATA
             // (ACTIVE_DEVICE_CHANGED / AUDIO_STATE_CHANGED pointing to watch, or Lzf0/Lyf0.a/b).
-            Class<?> pa5Class = findClassSafe(cl, "q25", "pa5");
-            Class<?> xpClass = findClassSafe(cl, "xp");
+            Class<?> pa5Class = resolveTargetClass(cl, sAutoTargets != null ? sAutoTargets.voipWatchAnswerClass : null, "q25", "pa5");
+            Class<?> xpClass = resolveTargetClass(cl, sAutoTargets != null ? sAutoTargets.bleDevicePacketClass : null, "xp");
             if (pa5Class != null && xpClass != null && hasMethod(pa5Class, "f", xpClass, int.class, byte[].class)) {
                 HookBridge.findAndHookMethod(pa5Class, "f", xpClass, int.class, byte[].class, new HookBridge.MethodHook() {
                     @Override
@@ -5774,5 +5977,1070 @@ public class NotifyWeatherHook {
         } catch (Throwable t) {
             logError("[VoipFix] stopVoipWatchAudioRouting failed", t);
         }
+    }
+
+    // =========================================================================
+    // 14. Home Assistant Lights BLE Bridge (Endpoint 0xA0, AppID 1066510)
+    //     Version-proof dynamic Endpoint 0xA0 discovery for Notify v24.1.1 & v24.0.3
+    // =========================================================================
+    private void hookHomeAssistantEndpointA0(final ClassLoader cl) {
+        try {
+            final Class<?> bleMgrClass = findClassSafe(cl, "com.mc.miband1.bluetooth.BLEManager", "com.mc.miband1.ble.BLEManager");
+
+            // 1. Direct Auto-Resolved Endpoint 0xA0 class (immediate hook at startup!)
+            if (sAutoTargets != null && sAutoTargets.endpointA0Class != null && !sAutoTargets.endpointA0Class.isEmpty()) {
+                Class<?> autoA0 = HookBridge.findClassIfExists(sAutoTargets.endpointA0Class, cl);
+                if (autoA0 != null && sHookedHaA0Classes.add(autoA0.getName())) {
+                    installHaEndpointA0HandlerHook(autoA0, bleMgrClass, cl);
+                }
+            }
+
+            // 2. Dynamic runtime fallback: hook Endpoint Manager (int -> BaseEndpoint) lookup for 0xA0
+            Class<?> s6Class = resolveTargetClass(cl, sAutoTargets != null ? sAutoTargets.agpsEndpointS6Class : null, "s6");
+            Class<?> baseEndpointClass = resolveTargetClass(cl, sAutoTargets != null ? sAutoTargets.baseEndpointClass : null);
+            if (baseEndpointClass == null) {
+                if (sEndpoint14Class != null && sEndpoint14Class.getSuperclass() != null && sEndpoint14Class.getSuperclass() != Object.class) {
+                    baseEndpointClass = sEndpoint14Class.getSuperclass();
+                } else if (s6Class != null && s6Class.getSuperclass() != null && s6Class.getSuperclass() != Object.class) {
+                    baseEndpointClass = s6Class.getSuperclass();
+                }
+            }
+
+            if (bleMgrClass == null || baseEndpointClass == null) {
+                logError("[HABridge] Could not resolve bleMgrClass=" + bleMgrClass + " or baseEndpointClass=" + baseEndpointClass, null);
+                return;
+            }
+
+            int hookedLookups = 0;
+            Set<String> hookedLookupKeys = new HashSet<>();
+            Class<?> cur = bleMgrClass;
+            while (cur != null && cur != Object.class) {
+                for (Field f : cur.getDeclaredFields()) {
+                    Class<?> ft = f.getType();
+                    if (ft.isPrimitive() || ft.isArray()) continue;
+                    String ftName = ft.getName();
+                    if (ftName.startsWith("java.") || ftName.startsWith("android.")) continue;
+                    for (Method m : ft.getDeclaredMethods()) {
+                        Class<?>[] pts = m.getParameterTypes();
+                        if (pts.length == 1 && pts[0] == int.class && m.getReturnType() == baseEndpointClass) {
+                            String key = ftName + "#" + m.getName();
+                            if (!hookedLookupKeys.add(key)) continue;
+                            HookBridge.findAndHookMethod(ft, m.getName(), int.class, new HookBridge.MethodHook() {
+                                @Override
+                                protected void afterHookedMethod(MethodHookParam param) {
+                                    if (param.args == null || param.args.length < 1 || !(param.args[0] instanceof Integer)) return;
+                                    int ep = (Integer) param.args[0];
+                                    if (ep != 0xA0) return;
+                                    Object handler = param.getResult();
+                                    if (handler == null) return;
+                                    Class<?> a0Class = handler.getClass();
+                                    if (sHookedHaA0Classes.add(a0Class.getName())) {
+                                        installHaEndpointA0HandlerHook(a0Class, bleMgrClass, cl);
+                                    }
+                                }
+                            });
+                            hookedLookups++;
+                            logInfo("[HABridge] Hooked dynamic Endpoint Manager lookup " + key + "(int) -> " + baseEndpointClass.getName());
+                        }
+                    }
+                }
+                cur = cur.getSuperclass();
+            }
+
+            if (hookedLookups == 0) {
+                logError("[HABridge] No Endpoint Manager (int -> " + baseEndpointClass.getName() + ") lookup method found on " + bleMgrClass.getName(), null);
+            }
+        } catch (Throwable t) {
+            logError("[HABridge] hookHomeAssistantEndpointA0 failed", t);
+        }
+    }
+
+    private static void installHaEndpointA0HandlerHook(final Class<?> a0Class, final Class<?> bleMgrClass, final ClassLoader cl) {
+        try {
+            Class<?> xpClass = resolveTargetClass(cl, sAutoTargets != null ? sAutoTargets.bleDevicePacketClass : null, "xp");
+            String autoRxMethod = (sAutoTargets != null && sAutoTargets.endpointA0ReceiveMethod != null)
+                    ? sAutoTargets.endpointA0ReceiveMethod : "f";
+            Method receiveMethod = null;
+
+            // 1. Prefer exact declared method f(xpClass, int, byte[]) on a0Class
+            if (xpClass != null) {
+                try {
+                    receiveMethod = a0Class.getDeclaredMethod(autoRxMethod, xpClass, int.class, byte[].class);
+                } catch (NoSuchMethodException ignored) {
+                }
+            }
+            // 2. Fallback: scan a0Class (then superclasses) for any method matching (?, int, byte[])
+            if (receiveMethod == null) {
+                Class<?> cur = a0Class;
+                while (cur != null && cur != Object.class && receiveMethod == null) {
+                    for (Method m : cur.getDeclaredMethods()) {
+                        Class<?>[] pts = m.getParameterTypes();
+                        if (pts.length == 3 && !pts[0].isPrimitive() && pts[1] == int.class && pts[2] == byte[].class) {
+                            receiveMethod = m;
+                            if ("f".equals(m.getName())) break;
+                        }
+                    }
+                    cur = cur.getSuperclass();
+                }
+            }
+
+            if (receiveMethod == null) {
+                logError("[HABridge] Could not find packet receive method (?, int, byte[]) on Endpoint 0xA0 class " + a0Class.getName(), null);
+                return;
+            }
+
+            Class<?>[] pts = receiveMethod.getParameterTypes();
+            HookBridge.findAndHookMethod(receiveMethod.getDeclaringClass(), receiveMethod.getName(),
+                    pts[0], pts[1], pts[2], new HookBridge.MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            if (!isHaBridgeEnabled(cl)) return;
+                            if (param.args == null || param.args.length < 3) return;
+                            // NOTE: In Lbx.f(Lxp, int, byte[]), param.args[1] is the BLE transport packet sequence number
+                            // (Ler.q = 0, 1, 2, ...), NOT the endpoint ID 0xA0! a0Class IS already the dedicated Endpoint 0xA0 handler.
+                            int seq = (param.args[1] instanceof Integer) ? (Integer) param.args[1] : -1;
+                            byte[] data = (param.args[2] instanceof byte[]) ? (byte[]) param.args[2] : null;
+                            if (data == null || data.length < 12) return;
+                            if (data[0] != 1 || data[1] != 1) return;
+
+                            long appId = readUint32LE(data, 8);
+                            int pktType = data[2] & 0xFF;
+                            logInfo("[HABridge] RX 0xA0 packet: seq=" + seq + ", pktType=" + pktType
+                                    + ", appId=" + appId + ", len=" + data.length);
+                            if (appId != HA_LIGHTS_APP_ID) return;
+
+                            // Consume packet so Notify's built-in 0xA0 handler doesn't reject our custom AppID
+                            param.setResult(null);
+
+                            final Object bleMgr = extractBleManagerFromEndpointHandler(param.thisObject, bleMgrClass);
+                            if (bleMgr == null) {
+                                logError("[HABridge] BLEManager instance not found on " + param.thisObject.getClass().getName(), null);
+                                return;
+                            }
+
+                            if (pktType == 1) {
+                                // Handshake / Connect
+                                final byte[] reply = Arrays.copyOf(data, data.length);
+                                if (reply.length > 0) reply[reply.length - 1] = 0;
+                                if (reply.length > 7) {
+                                    reply[6] = (byte) 0xE2;
+                                    reply[7] = 3;
+                                }
+                                logInfo("[HABridge] Watch AppID=" + appId + " handshake (len=" + data.length + ") -> replying ACK on 0xA0");
+                                sHaExecutor.execute(() -> sendEndpointA0Raw(cl, bleMgr, reply));
+                            } else if (pktType == 2) {
+                                logInfo("[HABridge] Watch AppID=" + appId + " disconnected");
+                            } else if (pktType == 4) {
+                                if (data.length <= 0x52) {
+                                    logInfo("[HABridge] Watch AppID=" + appId + " empty RPC packet (len=" + data.length + ")");
+                                    return;
+                                }
+                                final byte[] reqCopy = Arrays.copyOf(data, data.length);
+                                sHaExecutor.execute(() -> handleHaWatchRequest(cl, bleMgr, reqCopy));
+                            } else {
+                                logInfo("[HABridge] Watch AppID=" + appId + " unhandled pktType=" + pktType + " (len=" + data.length + ")");
+                            }
+                        }
+                    });
+            logInfo("[HABridge] Installed Endpoint 0xA0 hook on " + receiveMethod.getDeclaringClass().getName()
+                    + "." + receiveMethod.getName() + "(" + pts[0].getSimpleName() + ", int, byte[])");
+        } catch (Throwable t) {
+            logError("[HABridge] installHaEndpointA0HandlerHook failed for " + a0Class.getName(), t);
+        }
+    }
+
+    private static Object extractBleManagerFromEndpointHandler(Object handlerObj, Class<?> bleMgrClass) {
+        if (handlerObj == null) return null;
+        if (bleMgrClass != null) {
+            Class<?> cur = handlerObj.getClass();
+            while (cur != null && cur != Object.class) {
+                for (Field f : cur.getDeclaredFields()) {
+                    if (bleMgrClass.isAssignableFrom(f.getType())) {
+                        try {
+                            f.setAccessible(true);
+                            Object val = f.get(handlerObj);
+                            if (val != null) return val;
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                }
+                cur = cur.getSuperclass();
+            }
+        }
+        try {
+            return HookBridge.getObjectField(handlerObj, "b");
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static void handleHaWatchRequest(ClassLoader cl, Object bleMgr, byte[] reqData) {
+        try {
+            int jsonEnd = reqData.length;
+            while (jsonEnd > 0x52 && (reqData[jsonEnd - 1] == 0 || reqData[jsonEnd - 1] == ' '
+                    || reqData[jsonEnd - 1] == '\r' || reqData[jsonEnd - 1] == '\n')) {
+                jsonEnd--;
+            }
+            String reqJsonStr = new String(reqData, 0x52, Math.max(0, jsonEnd - 0x52), StandardCharsets.UTF_8).trim();
+            logInfo("[HABridge] RX Watch RPC: " + reqJsonStr);
+
+            JSONObject reqObj = new JSONObject(reqJsonStr);
+            String method = reqObj.optString("method", "");
+            JSONObject params = reqObj.optJSONObject("params");
+
+            if ((sHaUrl == null || sHaUrl.isEmpty()) || (sHaToken == null || sHaToken.isEmpty())) {
+                loadModuleConfigFromPrefs(sAppContext, cl);
+            }
+
+            String baseUrl = sHaUrl != null ? sHaUrl.trim() : "";
+            while (baseUrl.endsWith("/")) {
+                baseUrl = baseUrl.substring(0, baseUrl.length() - 1).trim();
+            }
+            String token = sHaToken != null ? sHaToken.trim() : "";
+            String filterRaw = sHaFilter != null ? sHaFilter.trim() : "";
+
+            JSONObject resultObj = new JSONObject();
+            if (baseUrl.isEmpty() || token.isEmpty()) {
+                resultObj.put("ok", false);
+                resultObj.put("err", "請先在手機設定 HA 網址與 Token");
+                sendEndpointA0JsonRpcReply(cl, bleMgr, reqData, resultObj);
+                return;
+            }
+
+            if ("HA_GET_LIGHTS".equals(method)) {
+                String[] resp = httpRequestHa("GET", baseUrl + "/api/states", token, null);
+                int code = Integer.parseInt(resp[0]);
+                if (code != 200) {
+                    resultObj.put("ok", false);
+                    resultObj.put("err", code == 401 ? "HA Token 無效 (401)" : ("HA 錯誤 HTTP " + code));
+                } else {
+                    org.json.JSONArray states = new org.json.JSONArray(resp[1]);
+                    String[] filters = filterRaw.isEmpty() ? new String[0] : filterRaw.split(",");
+                    List<JSONObject> onLights = new ArrayList<>();
+                    List<JSONObject> offLights = new ArrayList<>();
+
+                    for (int i = 0; i < states.length(); i++) {
+                        JSONObject st = states.optJSONObject(i);
+                        if (st == null) continue;
+                        String eid = st.optString("entity_id", "");
+                        if (!eid.startsWith("light.")) continue;
+                        String stateStr = st.optString("state", "");
+                        if ("unavailable".equalsIgnoreCase(stateStr)) continue;
+
+                        JSONObject attrs = st.optJSONObject("attributes");
+                        String fname = (attrs != null) ? attrs.optString("friendly_name", eid) : eid;
+                        if (fname == null || fname.trim().isEmpty()) fname = eid;
+
+                        if (filters.length > 0) {
+                            boolean hit = false;
+                            String eidLow = eid.toLowerCase(Locale.ROOT);
+                            String fnLow = fname.toLowerCase(Locale.ROOT);
+                            for (String f : filters) {
+                                String kw = f.trim().toLowerCase(Locale.ROOT);
+                                if (!kw.isEmpty() && (eidLow.contains(kw) || fnLow.contains(kw))) {
+                                    hit = true;
+                                    break;
+                                }
+                            }
+                            if (!hit) continue;
+                        }
+
+                        boolean isOn = "on".equalsIgnoreCase(stateStr);
+                        JSONObject item = new JSONObject();
+                        item.put("id", eid);
+                        item.put("n", fname.length() > 20 ? fname.substring(0, 20) : fname);
+                        item.put("on", isOn);
+                        if (isOn) {
+                            onLights.add(item);
+                        } else {
+                            offLights.add(item);
+                        }
+                    }
+
+                    org.json.JSONArray lightsArr = new org.json.JSONArray();
+                    int limit = 24;
+                    for (JSONObject item : onLights) {
+                        if (lightsArr.length() >= limit) break;
+                        lightsArr.put(item);
+                    }
+                    for (JSONObject item : offLights) {
+                        if (lightsArr.length() >= limit) break;
+                        lightsArr.put(item);
+                    }
+
+                    resultObj.put("ok", true);
+                    resultObj.put("lights", lightsArr);
+                    logInfo("[HABridge] HA_GET_LIGHTS returned " + lightsArr.length() + " lights");
+                }
+            } else if ("HA_TOGGLE_LIGHT".equals(method)) {
+                String entityId = params != null ? params.optString("entity_id", "").trim() : "";
+                if (!entityId.startsWith("light.")) {
+                    resultObj.put("ok", false);
+                    resultObj.put("err", "無效的電燈 entity_id");
+                } else {
+                    boolean hasTarget = params != null && params.has("target_on");
+                    boolean targetOn = params != null && params.optBoolean("target_on", true);
+                    String service = hasTarget ? (targetOn ? "turn_on" : "turn_off") : "toggle";
+
+                    JSONObject bodyObj = new JSONObject();
+                    bodyObj.put("entity_id", entityId);
+                    String[] resp = httpRequestHa("POST", baseUrl + "/api/services/light/" + service, token, bodyObj.toString());
+                    int code = Integer.parseInt(resp[0]);
+                    if (code >= 200 && code < 300) {
+                        boolean finalOn = targetOn;
+                        try {
+                            org.json.JSONArray changed = new org.json.JSONArray(resp[1]);
+                            for (int i = 0; i < changed.length(); i++) {
+                                JSONObject c = changed.optJSONObject(i);
+                                if (c != null && entityId.equals(c.optString("entity_id"))) {
+                                    finalOn = "on".equalsIgnoreCase(c.optString("state", ""));
+                                    break;
+                                }
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                        resultObj.put("ok", true);
+                        resultObj.put("id", entityId);
+                        resultObj.put("on", finalOn);
+                        logInfo("[HABridge] HA_TOGGLE_LIGHT " + entityId + " (" + service + ") -> on=" + finalOn);
+                    } else {
+                        resultObj.put("ok", false);
+                        resultObj.put("err", code == 401 ? "HA Token 無效 (401)" : ("切換失敗 HTTP " + code));
+                    }
+                }
+            } else {
+                resultObj.put("ok", false);
+                resultObj.put("err", "未知指令: " + method);
+            }
+
+            sendEndpointA0JsonRpcReply(cl, bleMgr, reqData, resultObj);
+        } catch (Throwable t) {
+            logError("[HABridge] handleHaWatchRequest failed", t);
+            try {
+                JSONObject errObj = new JSONObject();
+                errObj.put("ok", false);
+                errObj.put("err", "無法連線 HA (" + t.getClass().getSimpleName() + ")");
+                sendEndpointA0JsonRpcReply(cl, bleMgr, reqData, errObj);
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private static String[] httpRequestHa(String httpMethod, String urlStr, String token, String jsonBody) throws Exception {
+        java.net.HttpURLConnection conn = null;
+        try {
+            java.net.URL url = new java.net.URL(urlStr);
+            conn = (java.net.HttpURLConnection) url.openConnection();
+            conn.setRequestMethod(httpMethod);
+            conn.setConnectTimeout(4500);
+            conn.setReadTimeout(6500);
+            conn.setRequestProperty("Authorization", "Bearer " + token);
+            conn.setRequestProperty("Accept", "application/json");
+            if (jsonBody != null) {
+                byte[] outBytes = jsonBody.getBytes(StandardCharsets.UTF_8);
+                conn.setDoOutput(true);
+                conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
+                conn.setFixedLengthStreamingMode(outBytes.length);
+                try (java.io.OutputStream os = conn.getOutputStream()) {
+                    os.write(outBytes);
+                }
+            }
+            int code = conn.getResponseCode();
+            java.io.InputStream is = (code >= 200 && code < 300) ? conn.getInputStream() : conn.getErrorStream();
+            StringBuilder sb = new StringBuilder();
+            if (is != null) {
+                try (java.io.BufferedReader br = new java.io.BufferedReader(
+                        new java.io.InputStreamReader(is, StandardCharsets.UTF_8))) {
+                    String line;
+                    while ((line = br.readLine()) != null) {
+                        sb.append(line);
+                    }
+                }
+            }
+            return new String[]{String.valueOf(code), sb.toString()};
+        } finally {
+            if (conn != null) conn.disconnect();
+        }
+    }
+
+    private static void sendEndpointA0JsonRpcReply(ClassLoader cl, Object bleMgr, byte[] reqData, JSONObject resultObj) {
+        try {
+            JSONObject envelope = new JSONObject();
+            envelope.put("jsonrpc", "hmrpcv1");
+            envelope.put("result", resultObj);
+            byte[] payloadBytes = envelope.toString().getBytes(StandardCharsets.UTF_8);
+
+            byte[] header = Arrays.copyOfRange(reqData, 0, 0x52);
+            writeUint32LE(header, 0x20, payloadBytes.length);
+            writeUint32LE(header, 0x24, payloadBytes.length);
+            header[0x28] = 2; // TYPE_RESPONSE
+            writeUint32LE(header, 0x2A, System.currentTimeMillis() % 10000000L);
+
+            byte[] packet = new byte[header.length + payloadBytes.length];
+            System.arraycopy(header, 0, packet, 0, header.length);
+            System.arraycopy(payloadBytes, 0, packet, header.length, payloadBytes.length);
+
+            sendEndpointA0Raw(cl, bleMgr, packet);
+        } catch (Throwable t) {
+            logError("[HABridge] sendEndpointA0JsonRpcReply failed", t);
+        }
+    }
+
+    private static void sendEndpointA0Raw(ClassLoader cl, Object bleMgr, byte[] packet) {
+        try {
+            Method m = sHaSendRawMethod;
+            boolean is5Args = sHaSendRawIs5Args;
+
+            if (m == null) {
+                Class<?> bleMgrClass = bleMgr.getClass();
+                String autoSender = (sAutoTargets != null) ? sAutoTargets.bleRawSenderClass : null;
+                String auto5Arg = (sAutoTargets != null && sAutoTargets.bleRawSenderMethod != null) ? sAutoTargets.bleRawSenderMethod : "g";
+                String auto3Arg = (sAutoTargets != null && sAutoTargets.bleRawSender3ArgMethod != null) ? sAutoTargets.bleRawSender3ArgMethod : "l";
+                String[] candidates = new String[]{autoSender, "ac2", "gc2", "fc2", "cc2", "bc2", "dc2", "ec2", "hc2"};
+                for (String name : candidates) {
+                    if (name == null || name.isEmpty()) continue;
+                    Class<?> c = findClassSafe(cl, name);
+                    if (c == null) continue;
+                    // Check static g(BLEManager, int, <callback/bytes>, byte[], boolean)
+                    for (Method dm : c.getDeclaredMethods()) {
+                        if (!java.lang.reflect.Modifier.isStatic(dm.getModifiers())) continue;
+                        Class<?>[] pts = dm.getParameterTypes();
+                        if ((auto5Arg.equals(dm.getName()) || "g".equals(dm.getName())) && pts.length == 5
+                                && pts[0].isAssignableFrom(bleMgrClass)
+                                && pts[1] == int.class
+                                && !pts[2].isPrimitive()
+                                && pts[3] == byte[].class
+                                && pts[4] == boolean.class) {
+                            dm.setAccessible(true);
+                            m = dm;
+                            is5Args = true;
+                            break;
+                        }
+                    }
+                    if (m != null) break;
+                    // Fallback: check static l(BLEManager, int, byte[])
+                    for (Method dm : c.getDeclaredMethods()) {
+                        if (!java.lang.reflect.Modifier.isStatic(dm.getModifiers())) continue;
+                        Class<?>[] pts = dm.getParameterTypes();
+                        if ((auto3Arg.equals(dm.getName()) || "l".equals(dm.getName())) && pts.length == 3
+                                && pts[0].isAssignableFrom(bleMgrClass)
+                                && pts[1] == int.class
+                                && pts[2] == byte[].class) {
+                            dm.setAccessible(true);
+                            m = dm;
+                            is5Args = false;
+                            break;
+                        }
+                    }
+                    if (m != null) break;
+                }
+                if (m != null) {
+                    sHaSendRawMethod = m;
+                    sHaSendRawIs5Args = is5Args;
+                    logInfo("[HABridge] Resolved Endpoint 0xA0 sender: " + m.getDeclaringClass().getName()
+                            + "." + m.getName() + " (" + (is5Args ? "5-arg" : "3-arg") + ")");
+                }
+            }
+
+            if (m == null) {
+                logError("[HABridge] Cannot send Endpoint 0xA0 packet: raw sender method not found", null);
+                return;
+            }
+            if (is5Args) {
+                m.invoke(null, bleMgr, 0xA0, null, packet, false);
+            } else {
+                m.invoke(null, bleMgr, 0xA0, packet);
+            }
+            logInfo("[HABridge] TX Endpoint 0xA0 packet (" + packet.length + " bytes)");
+        } catch (Throwable t) {
+            logError("[HABridge] sendEndpointA0Raw failed", t);
+        }
+    }
+
+    private static long readUint32LE(byte[] buf, int offset) {
+        return ((buf[offset] & 0xFFL))
+                | ((buf[offset + 1] & 0xFFL) << 8)
+                | ((buf[offset + 2] & 0xFFL) << 16)
+                | ((buf[offset + 3] & 0xFFL) << 24);
+    }
+
+    private static void writeUint32LE(byte[] buf, int offset, long val) {
+        buf[offset] = (byte) (val & 0xFF);
+        buf[offset + 1] = (byte) ((val >>> 8) & 0xFF);
+        buf[offset + 2] = (byte) ((val >>> 16) & 0xFF);
+        buf[offset + 3] = (byte) ((val >>> 24) & 0xFF);
+    }
+
+    // =========================================================================
+    // 15. Official Zepp DfuV5 Safe Watch Mini-Program Installer
+    //     GATT Service 00001530 / CPT 00001531 / PKT 00001532
+    //     Opcodes: 0xD0 -> 0xD1 -> 0xD2 (FIRMWARE_LITE_APP = 0xA0) -> 0xD3 0x01
+    //              -> data chunks + 0xD4 ACK -> 0xD5 CRC32 verify -> 0xD6 install
+    // =========================================================================
+    private static final java.util.UUID UUID_DFU_SVC = java.util.UUID.fromString("00001530-0000-3512-2118-0009af100700");
+    private static final java.util.UUID UUID_DFU_CPT = java.util.UUID.fromString("00001531-0000-3512-2118-0009af100700");
+    private static final java.util.UUID UUID_DFU_PKT = java.util.UUID.fromString("00001532-0000-3512-2118-0009af100700");
+    private static final java.util.UUID UUID_GATT_CCCD = java.util.UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
+    private static final byte DFU_TYPE_FIRMWARE_LITE_APP = (byte) 0xA0; // Official Zepp.apk Ligk.v
+
+    private static volatile boolean sZpkInstallActive = false;
+    private static final java.util.concurrent.LinkedBlockingQueue<byte[]> sZpkDfuNotifyQueue =
+            new java.util.concurrent.LinkedBlockingQueue<>();
+    private static volatile CountDownLatch sZpkWriteLatch = null;
+    private static volatile int sZpkLastWriteStatus = -1;
+    private static volatile int sZpkLastWriteRc = -1;
+    private static volatile boolean sZpkLastWriteLatchHit = false;
+    private static volatile CountDownLatch sZpkDescLatch = null;
+    private static volatile int sZpkLastDescStatus = -1;
+    private static final Set<String> sHookedGattCallbackClasses = Collections.synchronizedSet(new HashSet<>());
+
+    private void hookZeppDfuV5AppInstaller(final ClassLoader cl) {
+        try {
+            // 1. Hook all BluetoothGattCallback subclasses discovered by NotifyAutoResolver (e.g. Lfs, Lvt$a)
+            if (sAutoTargets != null && !sAutoTargets.gattCallbackClasses.isEmpty()) {
+                for (String cbName : sAutoTargets.gattCallbackClasses) {
+                    Class<?> cbClass = HookBridge.findClassIfExists(cbName, cl);
+                    if (cbClass != null && android.bluetooth.BluetoothGattCallback.class.isAssignableFrom(cbClass)) {
+                        installDfuGattCallbackHooks(cbClass);
+                    }
+                }
+            }
+            // 2. Also probe known fallback name "fs" if it extends BluetoothGattCallback
+            Class<?> fsCand = HookBridge.findClassIfExists("fs", cl);
+            if (fsCand != null && android.bluetooth.BluetoothGattCallback.class.isAssignableFrom(fsCand)) {
+                installDfuGattCallbackHooks(fsCand);
+            }
+            // 3. Also scan BLEManager fields (in case a future version stores callback directly)
+            Class<?> bleMgrClass = findClassSafe(cl, "com.mc.miband1.bluetooth.BLEManager", "com.mc.miband1.ble.BLEManager");
+            if (bleMgrClass != null) {
+                Class<?> cur = bleMgrClass;
+                while (cur != null && cur != Object.class) {
+                    for (Field f : cur.getDeclaredFields()) {
+                        Class<?> ft = f.getType();
+                        if (android.bluetooth.BluetoothGattCallback.class.isAssignableFrom(ft)
+                                && ft != android.bluetooth.BluetoothGattCallback.class) {
+                            installDfuGattCallbackHooks(ft);
+                        }
+                    }
+                    cur = cur.getSuperclass();
+                }
+            }
+        } catch (Throwable t) {
+            logError("[ZeppDfuV5] hookZeppDfuV5AppInstaller failed", t);
+        }
+    }
+
+    private static void installDfuGattCallbackHooks(Class<?> cbClass) {
+        if (cbClass == null || !sHookedGattCallbackClasses.add(cbClass.getName())) return;
+        try {
+            // 1. onCharacteristicChanged (API 33+ 3-arg if declared)
+            if (hasMethod(cbClass, "onCharacteristicChanged",
+                    android.bluetooth.BluetoothGatt.class,
+                    android.bluetooth.BluetoothGattCharacteristic.class,
+                    byte[].class)) {
+                HookBridge.findAndHookMethod(cbClass, "onCharacteristicChanged",
+                        android.bluetooth.BluetoothGatt.class,
+                        android.bluetooth.BluetoothGattCharacteristic.class,
+                        byte[].class, new HookBridge.MethodHook() {
+                            @Override
+                            protected void beforeHookedMethod(MethodHookParam param) {
+                                if (!sZpkInstallActive) return;
+                                android.bluetooth.BluetoothGattCharacteristic ch =
+                                        (android.bluetooth.BluetoothGattCharacteristic) param.args[1];
+                                byte[] val = (byte[]) param.args[2];
+                                if (ch != null && UUID_DFU_CPT.equals(ch.getUuid()) && val != null) {
+                                    sZpkDfuNotifyQueue.offer(Arrays.copyOf(val, val.length));
+                                    param.setResult(null);
+                                }
+                            }
+                        });
+            }
+            // 2. onCharacteristicChanged (2-arg legacy / bridged on API 33+)
+            if (hasMethod(cbClass, "onCharacteristicChanged",
+                    android.bluetooth.BluetoothGatt.class,
+                    android.bluetooth.BluetoothGattCharacteristic.class)) {
+                HookBridge.findAndHookMethod(cbClass, "onCharacteristicChanged",
+                        android.bluetooth.BluetoothGatt.class,
+                        android.bluetooth.BluetoothGattCharacteristic.class, new HookBridge.MethodHook() {
+                            @Override
+                            @SuppressWarnings("deprecation")
+                            protected void beforeHookedMethod(MethodHookParam param) {
+                                if (!sZpkInstallActive) return;
+                                android.bluetooth.BluetoothGattCharacteristic ch =
+                                        (android.bluetooth.BluetoothGattCharacteristic) param.args[1];
+                                if (ch != null && UUID_DFU_CPT.equals(ch.getUuid())) {
+                                    byte[] val = ch.getValue();
+                                    if (val != null) {
+                                        sZpkDfuNotifyQueue.offer(Arrays.copyOf(val, val.length));
+                                    }
+                                    param.setResult(null);
+                                }
+                            }
+                        });
+            }
+            // 3. onCharacteristicWrite
+            if (hasMethod(cbClass, "onCharacteristicWrite",
+                    android.bluetooth.BluetoothGatt.class,
+                    android.bluetooth.BluetoothGattCharacteristic.class,
+                    int.class)) {
+                HookBridge.findAndHookMethod(cbClass, "onCharacteristicWrite",
+                        android.bluetooth.BluetoothGatt.class,
+                        android.bluetooth.BluetoothGattCharacteristic.class,
+                        int.class, new HookBridge.MethodHook() {
+                            @Override
+                            protected void beforeHookedMethod(MethodHookParam param) {
+                                if (!sZpkInstallActive) return;
+                                android.bluetooth.BluetoothGattCharacteristic ch =
+                                        (android.bluetooth.BluetoothGattCharacteristic) param.args[1];
+                                if (ch != null && (UUID_DFU_CPT.equals(ch.getUuid()) || UUID_DFU_PKT.equals(ch.getUuid()))) {
+                                    sZpkLastWriteStatus = (Integer) param.args[2];
+                                    CountDownLatch l = sZpkWriteLatch;
+                                    if (l != null) l.countDown();
+                                    param.setResult(null);
+                                }
+                            }
+                        });
+            }
+            // 4. onDescriptorWrite
+            if (hasMethod(cbClass, "onDescriptorWrite",
+                    android.bluetooth.BluetoothGatt.class,
+                    android.bluetooth.BluetoothGattDescriptor.class,
+                    int.class)) {
+                HookBridge.findAndHookMethod(cbClass, "onDescriptorWrite",
+                        android.bluetooth.BluetoothGatt.class,
+                        android.bluetooth.BluetoothGattDescriptor.class,
+                        int.class, new HookBridge.MethodHook() {
+                            @Override
+                            protected void beforeHookedMethod(MethodHookParam param) {
+                                if (!sZpkInstallActive) return;
+                                android.bluetooth.BluetoothGattDescriptor desc =
+                                        (android.bluetooth.BluetoothGattDescriptor) param.args[1];
+                                if (desc != null && desc.getCharacteristic() != null
+                                        && UUID_DFU_CPT.equals(desc.getCharacteristic().getUuid())) {
+                                    sZpkLastDescStatus = (Integer) param.args[2];
+                                    CountDownLatch l = sZpkDescLatch;
+                                    if (l != null) l.countDown();
+                                    param.setResult(null);
+                                }
+                            }
+                        });
+            }
+            logInfo("[ZeppDfuV5] Hooked BluetoothGattCallback for safe DfuV5 install: " + cbClass.getName());
+        } catch (Throwable t) {
+            logError("[ZeppDfuV5] installDfuGattCallbackHooks failed for " + cbClass.getName(), t);
+        }
+    }
+
+    private static void broadcastZpkProgress(Context ctx, String msg, boolean done, boolean success) {
+        if (ctx == null) ctx = sAppContext;
+        if (ctx == null) return;
+        try {
+            Intent i = new Intent(MainActivity.ACTION_ZPK_INSTALL_PROGRESS);
+            i.setPackage("com.amazfit.balance2fix");
+            i.addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES);
+            i.putExtra("msg", msg);
+            i.putExtra("done", done);
+            i.putExtra("success", success);
+            ctx.sendBroadcast(i);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static synchronized void runOfficialZeppDfuV5ZpkInstall(Context ctx, ClassLoader cl, byte[] deviceZipBytes, String appLabel) {
+        String label = (appLabel != null && !appLabel.isEmpty()) ? appLabel : "ZeppOS 小程式";
+        if (sZpkInstallActive || sAgpsTransferActive) {
+            broadcastZpkProgress(ctx, "⚠️ 已有其他藍牙傳輸正在進行中，請稍候完成再試。", true, false);
+            return;
+        }
+
+        // Triple Safety Check #1 (service-side re-validation before touching BLE!)
+        if (deviceZipBytes == null || deviceZipBytes.length < 512 || deviceZipBytes.length > 4 * 1024 * 1024
+                || deviceZipBytes[0] != 0x50 || deviceZipBytes[1] != 0x4B
+                || deviceZipBytes[2] != 0x03 || deviceZipBytes[3] != 0x04) {
+            broadcastZpkProgress(ctx, "❌ 服務端安全驗證失敗：無效的 device.zip 資料。", true, false);
+            return;
+        }
+        try {
+            boolean hasAppJson = false;
+            boolean hasAppBin = false;
+            String appJsonText = null;
+            try (java.util.zip.ZipInputStream zis = new java.util.zip.ZipInputStream(new java.io.ByteArrayInputStream(deviceZipBytes))) {
+                java.util.zip.ZipEntry ze;
+                while ((ze = zis.getNextEntry()) != null) {
+                    String n = ze.getName();
+                    String low = n.toLowerCase(Locale.ROOT);
+                    if (low.startsWith("meta/") || low.endsWith(".fw") || low.contains("firmware.bin") || low.contains("bootloader")) {
+                        broadcastZpkProgress(ctx, "🛡️ 服務端安全封鎖：拒絕系統韌體檔案 (" + n + ")！", true, false);
+                        return;
+                    }
+                    if ("app.json".equals(n)) {
+                        hasAppJson = true;
+                        java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+                        byte[] tmp = new byte[4096];
+                        int r;
+                        while ((r = zis.read(tmp)) != -1) baos.write(tmp, 0, r);
+                        appJsonText = new String(baos.toByteArray(), StandardCharsets.UTF_8);
+                    } else if ("app.bin".equals(n)) {
+                        hasAppBin = true;
+                    }
+                }
+            }
+            if (!hasAppJson || !hasAppBin || appJsonText == null) {
+                broadcastZpkProgress(ctx, "❌ 服務端驗證失敗：缺少 app.json 或 app.bin。", true, false);
+                return;
+            }
+            JSONObject appNode = new JSONObject(appJsonText).optJSONObject("app");
+            if (appNode == null || !"app".equalsIgnoreCase(appNode.optString("appType", "")) || appNode.optInt("appId", 0) <= 0) {
+                broadcastZpkProgress(ctx, "❌ 服務端驗證失敗：僅允許標準小程式 (appType=app)。", true, false);
+                return;
+            }
+        } catch (Throwable t) {
+            broadcastZpkProgress(ctx, "❌ 服務端安全驗證例外：" + t.getMessage(), true, false);
+            return;
+        }
+
+        Object bleMgr = getBleManagerInstance(cl);
+        if (bleMgr == null) {
+            broadcastZpkProgress(ctx, "❌ 找不到 Notify BLEManager（請先確認 Notify 已連線手錶）。", true, false);
+            return;
+        }
+        // Ensure the live GATT callback subclass is hooked even if initialized lazily
+        try {
+            Class<?> cur = bleMgr.getClass();
+            while (cur != null && cur != Object.class) {
+                for (Field f : cur.getDeclaredFields()) {
+                    if (android.bluetooth.BluetoothGattCallback.class.isAssignableFrom(f.getType())) {
+                        f.setAccessible(true);
+                        Object cbObj = f.get(bleMgr);
+                        if (cbObj != null) installDfuGattCallbackHooks(cbObj.getClass());
+                    }
+                }
+                cur = cur.getSuperclass();
+            }
+        } catch (Throwable ignored) {
+        }
+
+        android.bluetooth.BluetoothGatt gatt = getBluetoothGattFromBleManager(bleMgr);
+        if (gatt == null) {
+            broadcastZpkProgress(ctx, "❌ 手錶尚未建立藍牙 GATT 連線，請確認 Notify 已連線 Balance 2。", true, false);
+            return;
+        }
+        // Runtime belt-and-suspenders: also inspect BluetoothGatt.mCallback directly!
+        try {
+            Class<?> cur = gatt.getClass();
+            while (cur != null && cur != Object.class) {
+                for (Field f : cur.getDeclaredFields()) {
+                    if (android.bluetooth.BluetoothGattCallback.class.isAssignableFrom(f.getType())) {
+                        f.setAccessible(true);
+                        Object cbObj = f.get(gatt);
+                        if (cbObj != null) {
+                            installDfuGattCallbackHooks(cbObj.getClass());
+                        }
+                    }
+                }
+                cur = cur.getSuperclass();
+            }
+        } catch (Throwable ignored) {
+        }
+        logInfo("[ZeppDfuV5] Active hooked BluetoothGattCallback classes: " + sHookedGattCallbackClasses);
+
+        android.bluetooth.BluetoothGattService dfuSvc = gatt.getService(UUID_DFU_SVC);
+        if (dfuSvc == null) {
+            broadcastZpkProgress(ctx, "❌ 手錶未暴露 DFU 服務 (0x1530)，請重新連線手錶後再試。", true, false);
+            return;
+        }
+        android.bluetooth.BluetoothGattCharacteristic cpt = dfuSvc.getCharacteristic(UUID_DFU_CPT);
+        android.bluetooth.BluetoothGattCharacteristic pkt = dfuSvc.getCharacteristic(UUID_DFU_PKT);
+        if (cpt == null || pkt == null) {
+            broadcastZpkProgress(ctx, "❌ 找不到 DFU 特徵 (0x1531 / 0x1532)。", true, false);
+            return;
+        }
+
+        // Compute standard IEEE CRC32 of device.zip
+        java.util.zip.CRC32 crc32 = new java.util.zip.CRC32();
+        crc32.update(deviceZipBytes);
+        long totalCrc = crc32.getValue() & 0xFFFFFFFFL;
+        int totalSize = deviceZipBytes.length;
+
+        sZpkInstallActive = true;
+        sZpkDfuNotifyQueue.clear();
+
+        try {
+            // Boost BLE connection priority for fast & stable transfer
+            try {
+                gatt.requestConnectionPriority(android.bluetooth.BluetoothGatt.CONNECTION_PRIORITY_HIGH);
+            } catch (Throwable ignored) {
+            }
+
+            // Read negotiated MTU safely
+            int negotiatedMtu = 23;
+            try {
+                Object lo20 = HookBridge.getObjectField(bleMgr, "b");
+                if (lo20 != null) {
+                    int m = HookBridge.getIntField(lo20, "w");
+                    if (m >= 23 && m <= 517) negotiatedMtu = m;
+                }
+            } catch (Throwable ignored) {
+            }
+            int blePacketSize = Math.max(20, Math.min(negotiatedMtu - 3, 240));
+            logInfo("[ZeppDfuV5] START install '" + label + "': size=" + totalSize
+                    + ", crc32=0x" + Long.toHexString(totalCrc) + ", mtu=" + negotiatedMtu + ", pktSize=" + blePacketSize);
+
+            // Step 0: Enable notifications on 0x1531 (cpt)
+            broadcastZpkProgress(ctx, "⏳ [1/6] 開啟官方 DfuV5 控制通道 (0x1531)...", false, true);
+            gatt.setCharacteristicNotification(cpt, true);
+            android.bluetooth.BluetoothGattDescriptor cccd = cpt.getDescriptor(UUID_GATT_CCCD);
+            if (cccd != null) {
+                writeGattDescriptorSync(gatt, cccd, android.bluetooth.BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
+            }
+            Thread.sleep(150L);
+            sZpkDfuNotifyQueue.clear();
+
+            int cptWriteType = ((cpt.getProperties() & android.bluetooth.BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0)
+                    ? android.bluetooth.BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                    : android.bluetooth.BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT;
+            int pktWriteType = ((pkt.getProperties() & android.bluetooth.BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0)
+                    ? android.bluetooth.BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                    : android.bluetooth.BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT;
+
+            // Step 1: 0xD0 Query Protocol
+            broadcastZpkProgress(ctx, "⏳ [2/6] 查詢手錶 DfuV5 協定 (0xD0)...", false, true);
+            if (!writeGattCharSync(gatt, cpt, new byte[]{(byte) 0xD0}, cptWriteType)) {
+                broadcastZpkProgress(ctx, "❌ 寫入 0xD0 失敗 (rc=" + sZpkLastWriteRc
+                        + ", cbHit=" + sZpkLastWriteLatchHit
+                        + ", status=" + sZpkLastWriteStatus
+                        + ", props=0x" + Integer.toHexString(cpt.getProperties())
+                        + ", cbs=" + sHookedGattCallbackClasses.size() + ")，已安全中止。", true, false);
+                return;
+            }
+            byte[] respD0 = waitForDfuResponse((byte) 0xD0, 5000L);
+            if (respD0 == null || respD0.length < 3 || respD0[2] != 0x01) {
+                broadcastZpkProgress(ctx, "❌ 手錶 0xD0 回應異常 (" + (respD0 != null ? bytesToHex(respD0) : "逾時") + ")，已安全中止。", true, false);
+                return;
+            }
+            int watchChunkSize = 2048;
+            if (respD0.length >= 6) {
+                int rawChunk = (respD0[4] & 0xFF) | ((respD0[5] & 0xFF) << 8);
+                if (rawChunk >= 256 && rawChunk <= 16384) watchChunkSize = rawChunk;
+            }
+            logInfo("[ZeppDfuV5] 0xD0 OK: " + bytesToHex(respD0) + ", watchChunkSize=" + watchChunkSize);
+
+            // Step 2: 0xD1 Query Status
+            if (writeGattCharSync(gatt, cpt, new byte[]{(byte) 0xD1}, cptWriteType)) {
+                byte[] respD1 = waitForDfuResponse((byte) 0xD1, 3000L);
+                logInfo("[ZeppDfuV5] 0xD1 resp: " + (respD1 != null ? bytesToHex(respD1) : "timeout"));
+            }
+
+            // Step 3: 0xD2 Prepare Transfer (Official Zepp FIRMWARE_LITE_APP = 0xA0)
+            broadcastZpkProgress(ctx, "⏳ [3/6] 申請手錶小程式沙盒分區 (0xD2, type=0xA0)...", false, true);
+            byte[] pktD2 = new byte[13];
+            pktD2[0] = (byte) 0xD2;
+            pktD2[1] = DFU_TYPE_FIRMWARE_LITE_APP; // 0xA0 = FIRMWARE_LITE_APP (NEVER system firmware!)
+            writeUint32LE(pktD2, 2, totalSize);
+            writeUint32LE(pktD2, 6, totalCrc);
+            pktD2[10] = (byte) (watchChunkSize & 0xFF);
+            pktD2[11] = (byte) ((watchChunkSize >>> 8) & 0xFF);
+            pktD2[12] = 0x00;
+
+            if (!writeGattCharSync(gatt, cpt, pktD2, cptWriteType)) {
+                broadcastZpkProgress(ctx, "❌ 寫入 0xD2 失敗，已安全中止。", true, false);
+                return;
+            }
+            byte[] respD2 = waitForDfuResponse((byte) 0xD2, 5000L);
+            if (respD2 == null || respD2.length < 3 || respD2[2] != 0x01) {
+                broadcastZpkProgress(ctx, "❌ 手錶 0xD2 拒絕小程式預備 (" + (respD2 != null ? bytesToHex(respD2) : "逾時") + ")，手錶未受任何影響。", true, false);
+                return;
+            }
+            logInfo("[ZeppDfuV5] 0xD2 OK: " + bytesToHex(respD2));
+
+            // Step 4: 0xD3 Start Fresh Transfer ([0xD3, 0x01])
+            broadcastZpkProgress(ctx, "⏳ [4/6] 啟動資料傳輸 (0xD3)...", false, true);
+            if (!writeGattCharSync(gatt, cpt, new byte[]{(byte) 0xD3, 0x01}, cptWriteType)) {
+                broadcastZpkProgress(ctx, "❌ 寫入 0xD3 失敗，已安全中止。", true, false);
+                return;
+            }
+            byte[] respD3 = waitForDfuResponse((byte) 0xD3, 5000L);
+            if (respD3 == null || respD3.length < 3 || respD3[2] != 0x01) {
+                broadcastZpkProgress(ctx, "❌ 手錶 0xD3 啟動失敗 (" + (respD3 != null ? bytesToHex(respD3) : "逾時") + ")，已安全中止。", true, false);
+                return;
+            }
+            logInfo("[ZeppDfuV5] 0xD3 OK: " + bytesToHex(respD3));
+
+            // Step 5: Stream device.zip chunks to 0x1532 with 0xD4 window ACK
+            int sent = 0;
+            while (sent < totalSize) {
+                int windowEnd = Math.min(sent + watchChunkSize, totalSize);
+                int pos = sent;
+                while (pos < windowEnd) {
+                    int end = Math.min(pos + blePacketSize, windowEnd);
+                    byte[] slice = Arrays.copyOfRange(deviceZipBytes, pos, end);
+                    if (!writeGattCharSync(gatt, pkt, slice, pktWriteType)) {
+                        broadcastZpkProgress(ctx, "❌ 藍牙資料封包寫入失敗 (offset=" + pos + ")，已安全中止。", true, false);
+                        return;
+                    }
+                    pos = end;
+                }
+                byte[] ackD4 = waitForDfuResponse((byte) 0xD4, 12000L);
+                boolean d4Ok = false;
+                if (ackD4 != null && ackD4.length >= 2) {
+                    if (ackD4.length >= 6) {
+                        // Official DfuV5 0xD4 format (TransferContinueResponse / Lu8b0):
+                        // 10 D4 [receivedSize 4B LE] [retry 1B] [receivedDataState: 01=continue, 02=all_received]
+                        // e.g.Chunk 1: 10 D4 00 20 00 00 00 01 (8192 bytes, state=01 continue)
+                        //     Final  : 10 D4 B9 53 00 00 00 02 (21433 bytes, state=02 complete!)
+                        long watchRecvBytes = readUint32LE(ackD4, 2);
+                        int retryFlag = (ackD4.length >= 7) ? (ackD4[6] & 0xFF) : 0;
+                        int dataState = (ackD4.length >= 8) ? (ackD4[7] & 0xFF) : 1;
+                        d4Ok = (watchRecvBytes > sent) && (retryFlag == 0);
+                        logInfo("[ZeppDfuV5] 0xD4 ACK: watchRecv=" + watchRecvBytes + "/" + windowEnd
+                                + ", retry=" + retryFlag + ", state=0x" + String.format("%02X", dataState));
+                    } else {
+                        d4Ok = true;
+                    }
+                }
+                if (!d4Ok) {
+                    broadcastZpkProgress(ctx, "❌ 手錶分塊確認 (0xD4) 異常 (" + (ackD4 != null ? bytesToHex(ackD4) : "逾時") + ")，已安全中止。", true, false);
+                    return;
+                }
+                sent = windowEnd;
+                int pct = (int) ((sent * 100L) / totalSize);
+                broadcastZpkProgress(ctx, "⏳ [4/6] 正在安全傳送 " + label + "：" + pct + "% (" + (sent / 1024) + "/" + (totalSize / 1024) + " KB)", false, true);
+            }
+            logInfo("[ZeppDfuV5] All " + totalSize + " bytes transferred & ACKed");
+
+            // Step 6: 0xD5 Validate Full CRC32
+            broadcastZpkProgress(ctx, "⏳ [5/6] 手錶正在校驗完整 CRC32 (0xD5)...", false, true);
+            if (!writeGattCharSync(gatt, cpt, new byte[]{(byte) 0xD5}, cptWriteType)) {
+                broadcastZpkProgress(ctx, "❌ 寫入 0xD5 校驗指令失敗，已安全中止。", true, false);
+                return;
+            }
+            byte[] respD5 = waitForDfuResponse((byte) 0xD5, 15000L);
+            if (respD5 == null || respD5.length < 3 || respD5[2] != 0x01) {
+                broadcastZpkProgress(ctx, "❌ 手錶 CRC32 校驗未通過 (" + (respD5 != null ? bytesToHex(respD5) : "逾時") + ")，已中止安裝（未寫入）。", true, false);
+                return;
+            }
+            logInfo("[ZeppDfuV5] 0xD5 CRC32 PASS: " + bytesToHex(respD5));
+
+            // Step 7: 0xD6 Apply / Install into Sandboxed App List
+            broadcastZpkProgress(ctx, "⏳ [6/6] 正在安裝小程式至手錶應用程式列表 (0xD6)...", false, true);
+            if (!writeGattCharSync(gatt, cpt, new byte[]{(byte) 0xD6}, cptWriteType)) {
+                broadcastZpkProgress(ctx, "❌ 寫入 0xD6 安裝指令失敗。", true, false);
+                return;
+            }
+            byte[] respD6 = waitForDfuResponse((byte) 0xD6, 20000L);
+            logInfo("[ZeppDfuV5] 0xD6 resp: " + (respD6 != null ? bytesToHex(respD6) : "timeout"));
+            if (respD6 != null && respD6.length >= 3 && respD6[2] == 0x01) {
+                broadcastZpkProgress(ctx, "🎉 安裝完成！" + label + " 已成功安裝至 Balance 2，請在手錶應用程式列表開啟使用！", true, true);
+            } else {
+                broadcastZpkProgress(ctx, "⚠️ 手錶 0xD6 回應 (" + (respD6 != null ? bytesToHex(respD6) : "逾時") + ")，請檢查手錶應用程式列表是否已出現。", true, false);
+            }
+        } catch (Throwable t) {
+            logError("[ZeppDfuV5] runOfficialZeppDfuV5ZpkInstall failed", t);
+            broadcastZpkProgress(ctx, "❌ 安裝過程發生例外：" + t.getMessage(), true, false);
+        } finally {
+            try {
+                android.bluetooth.BluetoothGattDescriptor cccdCleanup = cpt.getDescriptor(UUID_GATT_CCCD);
+                if (cccdCleanup != null) {
+                    writeGattDescriptorSync(gatt, cccdCleanup, android.bluetooth.BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE);
+                }
+                gatt.setCharacteristicNotification(cpt, false);
+            } catch (Throwable ignored) {
+            }
+            sZpkInstallActive = false;
+            sZpkWriteLatch = null;
+            sZpkDescLatch = null;
+            sZpkDfuNotifyQueue.clear();
+        }
+    }
+
+    @SuppressWarnings("deprecation")
+    private static boolean writeGattCharSync(android.bluetooth.BluetoothGatt gatt,
+                                             android.bluetooth.BluetoothGattCharacteristic ch,
+                                             byte[] data,
+                                             int writeType) throws InterruptedException {
+        int curWriteType = writeType;
+        for (int attempt = 0; attempt < 6; attempt++) {
+            CountDownLatch latch = new CountDownLatch(1);
+            sZpkWriteLatch = latch;
+            sZpkLastWriteStatus = -1;
+            sZpkLastWriteRc = -1;
+            sZpkLastWriteLatchHit = false;
+            boolean initiated;
+            if (Build.VERSION.SDK_INT >= 33) {
+                int rc = gatt.writeCharacteristic(ch, data, curWriteType);
+                sZpkLastWriteRc = rc;
+                initiated = (rc == 0); // BluetoothStatusCodes.SUCCESS == 0
+                if (rc == 201) { // ERROR_GATT_WRITE_REQUEST_BUSY
+                    Thread.sleep(35L);
+                    continue;
+                }
+                if (!initiated) {
+                    int props = ch.getProperties();
+                    if (curWriteType == android.bluetooth.BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                            && (props & android.bluetooth.BluetoothGattCharacteristic.PROPERTY_WRITE) != 0) {
+                        curWriteType = android.bluetooth.BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT;
+                    } else if (curWriteType == android.bluetooth.BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                            && (props & android.bluetooth.BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0) {
+                        curWriteType = android.bluetooth.BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE;
+                    }
+                    Thread.sleep(35L);
+                    continue;
+                }
+            } else {
+                ch.setWriteType(curWriteType);
+                ch.setValue(data);
+                initiated = gatt.writeCharacteristic(ch);
+                sZpkLastWriteRc = initiated ? 0 : -2;
+            }
+            if (!initiated) {
+                Thread.sleep(35L);
+                continue;
+            }
+            boolean done = latch.await(4000L, java.util.concurrent.TimeUnit.MILLISECONDS);
+            sZpkLastWriteLatchHit = done;
+            if (done && sZpkLastWriteStatus == android.bluetooth.BluetoothGatt.GATT_SUCCESS) {
+                return true;
+            }
+            logInfo("[ZeppDfuV5] writeGattCharSync retry attempt=" + attempt + ", rc=" + sZpkLastWriteRc
+                    + ", done=" + done + ", status=" + sZpkLastWriteStatus + ", writeType=" + curWriteType);
+            Thread.sleep(40L);
+        }
+        return false;
+    }
+
+    @SuppressWarnings("deprecation")
+    private static void writeGattDescriptorSync(android.bluetooth.BluetoothGatt gatt,
+                                                android.bluetooth.BluetoothGattDescriptor desc,
+                                                byte[] val) {
+        try {
+            CountDownLatch latch = new CountDownLatch(1);
+            sZpkDescLatch = latch;
+            sZpkLastDescStatus = -1;
+            boolean ok;
+            if (Build.VERSION.SDK_INT >= 33) {
+                ok = (gatt.writeDescriptor(desc, val) == 0);
+            } else {
+                desc.setValue(val);
+                ok = gatt.writeDescriptor(desc);
+            }
+            if (ok) {
+                latch.await(2000L, java.util.concurrent.TimeUnit.MILLISECONDS);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static byte[] waitForDfuResponse(byte expectedCmd, long timeoutMs) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (System.currentTimeMillis() < deadline) {
+            long rem = Math.max(50L, deadline - System.currentTimeMillis());
+            byte[] pkt = sZpkDfuNotifyQueue.poll(rem, java.util.concurrent.TimeUnit.MILLISECONDS);
+            if (pkt == null) return null;
+            logInfo("[ZeppDfuV5] RX 0x1531: " + bytesToHex(pkt));
+            if (pkt.length >= 2 && pkt[0] == 0x10 && pkt[1] == expectedCmd) {
+                return pkt;
+            }
+        }
+        return null;
     }
 }
