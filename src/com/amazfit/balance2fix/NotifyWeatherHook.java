@@ -58,6 +58,8 @@ public class NotifyWeatherHook {
     private static volatile String sHaUrl = "";
     private static volatile String sHaToken = "";
     private static volatile String sHaFilter = "";
+    private static volatile String sZeppAppToken = "";
+    private static volatile String sCustomAppNames = "";
     private static volatile int sAgpsFormatMode = 2; // 2 = EPO (0x8C/0x8D/0x8E, verified Balance 2 bitmask 0x000F1C00), 3 = 7d LTO (0x8B), 4 = 2d LTO
     private static volatile long sAgpsLastUpdateMs = 0L;
     private static volatile long sAgpsExpireMs = 0L;
@@ -82,6 +84,8 @@ public class NotifyWeatherHook {
     private static final String PREF_MOD_HA_URL = "balance2_mod_ha_url";
     private static final String PREF_MOD_HA_TOKEN = "balance2_mod_ha_token";
     private static final String PREF_MOD_HA_FILTER = "balance2_mod_ha_filter";
+    private static final String PREF_MOD_ZEPP_APP_TOKEN = "balance2_mod_zepp_app_token";
+    private static final String PREF_MOD_CUSTOM_APP_NAMES = "balance2_mod_custom_app_names";
     private static final String PREF_MOD_AGPS_FORMAT = "balance2_mod_agps_format";
     private static final String PREF_AGPS_MIGRATED_EPO_V1 = "balance2_agps_migrated_epo_v1";
     private static final String PREF_AGPS_LAST_UPDATE_MS = "balance2_agps_last_update_ms";
@@ -316,6 +320,7 @@ public class NotifyWeatherHook {
         hookVoipCallPipeline(cl);
         hookHomeAssistantEndpointA0(cl);
         hookZeppDfuV5AppInstaller(cl);
+        ZeppAppMetadataManager.hookZeppOsAppsStoreActivity(cl);
 
         logInfo("All hooks installed for " + packageName);
     }
@@ -356,6 +361,8 @@ public class NotifyWeatherHook {
                 if (sp.contains(PREF_MOD_HA_URL)) sHaUrl = sp.getString(PREF_MOD_HA_URL, "");
                 if (sp.contains(PREF_MOD_HA_TOKEN)) sHaToken = sp.getString(PREF_MOD_HA_TOKEN, "");
                 if (sp.contains(PREF_MOD_HA_FILTER)) sHaFilter = sp.getString(PREF_MOD_HA_FILTER, "");
+                if (sp.contains(PREF_MOD_ZEPP_APP_TOKEN)) sZeppAppToken = sp.getString(PREF_MOD_ZEPP_APP_TOKEN, "");
+                if (sp.contains(PREF_MOD_CUSTOM_APP_NAMES)) sCustomAppNames = sp.getString(PREF_MOD_CUSTOM_APP_NAMES, "");
                 if (sp.contains(PREF_MOD_AGPS_FORMAT)) {
                     sAgpsFormatMode = sp.getInt(PREF_MOD_AGPS_FORMAT, 2);
                 }
@@ -404,9 +411,18 @@ public class NotifyWeatherHook {
                         String fl = xsp.getString(MainActivity.KEY_HA_FILTER, "");
                         if (fl != null) sHaFilter = fl;
                     }
+                    if (xsp.contains(MainActivity.KEY_ZEPP_APP_TOKEN)) {
+                        String zt = xsp.getString(MainActivity.KEY_ZEPP_APP_TOKEN, "");
+                        if (zt != null && !zt.isEmpty()) sZeppAppToken = zt;
+                    }
+                    if (xsp.contains(MainActivity.KEY_CUSTOM_APP_NAMES)) {
+                        String cn = xsp.getString(MainActivity.KEY_CUSTOM_APP_NAMES, "");
+                        if (cn != null) sCustomAppNames = cn;
+                    }
                 }
             } catch (Throwable ignored) {
             }
+            ZeppAppMetadataManager.updateConfig(sZeppAppToken, sCustomAppNames);
             // 3. Also check Notify's Lyx7/Lux7 AGPS timestamp ("22d907dc-6606-4aac-ba8d-d6219402818e")
             Context appCtx = ctx != null ? ctx.getApplicationContext() : sAppContext;
             if (appCtx != null && cl != null) {
@@ -441,6 +457,8 @@ public class NotifyWeatherHook {
                 ed.putString(PREF_MOD_HA_URL, sHaUrl != null ? sHaUrl : "");
                 ed.putString(PREF_MOD_HA_TOKEN, sHaToken != null ? sHaToken : "");
                 ed.putString(PREF_MOD_HA_FILTER, sHaFilter != null ? sHaFilter : "");
+                ed.putString(PREF_MOD_ZEPP_APP_TOKEN, sZeppAppToken != null ? sZeppAppToken : "");
+                ed.putString(PREF_MOD_CUSTOM_APP_NAMES, sCustomAppNames != null ? sCustomAppNames : "");
                 ed.putInt(PREF_MOD_AGPS_FORMAT, sAgpsFormatMode);
                 if (sAgpsLastUpdateMs > 0L) ed.putLong(PREF_AGPS_LAST_UPDATE_MS, sAgpsLastUpdateMs);
                 if (sAgpsExpireMs > 0L) ed.putLong(PREF_AGPS_EXPIRE_MS, sAgpsExpireMs);
@@ -531,6 +549,15 @@ public class NotifyWeatherHook {
                             String fl = intent.getStringExtra(MainActivity.KEY_HA_FILTER);
                             sHaFilter = fl != null ? fl.trim() : "";
                         }
+                        if (intent.hasExtra(MainActivity.KEY_ZEPP_APP_TOKEN)) {
+                            String zt = intent.getStringExtra(MainActivity.KEY_ZEPP_APP_TOKEN);
+                            sZeppAppToken = zt != null ? zt.trim() : "";
+                        }
+                        if (intent.hasExtra(MainActivity.KEY_CUSTOM_APP_NAMES)) {
+                            String cn = intent.getStringExtra(MainActivity.KEY_CUSTOM_APP_NAMES);
+                            sCustomAppNames = cn != null ? cn : "";
+                        }
+                        ZeppAppMetadataManager.updateConfig(sZeppAppToken, sCustomAppNames);
                         if (intent.hasExtra(MainActivity.KEY_AGPS_FORMAT)) {
                             int reqMode = intent.getIntExtra(MainActivity.KEY_AGPS_FORMAT, sAgpsFormatMode);
                             if (sWatchAgpsCapMask != 0L
@@ -6660,6 +6687,7 @@ public class NotifyWeatherHook {
             broadcastZpkProgress(ctx, "❌ 服務端安全驗證失敗：無效的 device.zip 資料。", true, false);
             return;
         }
+        ZeppAppMetadataManager.extractAndCacheFromDeviceZip(ctx, deviceZipBytes);
         try {
             boolean hasAppJson = false;
             boolean hasAppBin = false;

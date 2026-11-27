@@ -50,6 +50,8 @@ public class MainActivity extends Activity {
     public static final String KEY_HA_URL = "ha_url";
     public static final String KEY_HA_TOKEN = "ha_token";
     public static final String KEY_HA_FILTER = "ha_light_filter";
+    public static final String KEY_ZEPP_APP_TOKEN = "zepp_app_token";
+    public static final String KEY_CUSTOM_APP_NAMES = "custom_app_names";
     public static final String KEY_AGPS_FORMAT = "agps_format_mode"; // 2 = EPO (0x8C/8D/8E Balance 2), 3 = LTO (0x8B)
     public static final String KEY_AGPS_MIGRATED_EPO_V1 = "agps_migrated_epo_v1";
     public static final String KEY_AGPS_LAST_UPDATE = "agps_last_update_ms";
@@ -73,6 +75,9 @@ public class MainActivity extends Activity {
     private EditText etHaFilter;
     private TextView tvHaTestResult;
     private TextView tvZpkProgress;
+    private EditText etZeppToken;
+    private EditText etCustomAppNames;
+    private TextView tvZeppTokenResult;
     private TextView tvHookStatus;
     private TextView tvAgpsUpdate;
     private TextView tvAgpsExpire;
@@ -219,6 +224,12 @@ public class MainActivity extends Activity {
         if (etHaFilter != null) {
             etHaFilter.setText(prefs.getString(KEY_HA_FILTER, ""));
         }
+        if (etZeppToken != null) {
+            etZeppToken.setText(prefs.getString(KEY_ZEPP_APP_TOKEN, ""));
+        }
+        if (etCustomAppNames != null) {
+            etCustomAppNames.setText(prefs.getString(KEY_CUSTOM_APP_NAMES, ""));
+        }
         suppressSwitchCallback = false;
         refreshAgpsTimestampsUI();
     }
@@ -238,6 +249,8 @@ public class MainActivity extends Activity {
         String haUrl = etHaUrl != null ? normalizeHaUrl(etHaUrl.getText().toString()) : prefs.getString(KEY_HA_URL, "");
         String haToken = etHaToken != null ? etHaToken.getText().toString().trim() : prefs.getString(KEY_HA_TOKEN, "");
         String haFilter = etHaFilter != null ? etHaFilter.getText().toString().trim() : prefs.getString(KEY_HA_FILTER, "");
+        String zeppToken = etZeppToken != null ? etZeppToken.getText().toString().trim() : prefs.getString(KEY_ZEPP_APP_TOKEN, "");
+        String customAppNames = etCustomAppNames != null ? etCustomAppNames.getText().toString() : prefs.getString(KEY_CUSTOM_APP_NAMES, "");
         prefs.edit()
                 .putBoolean(KEY_WEATHER_FIX, swWeather.isChecked())
                 .putBoolean(KEY_AGPS_FIX, swAgps.isChecked())
@@ -247,6 +260,8 @@ public class MainActivity extends Activity {
                 .putString(KEY_HA_URL, haUrl)
                 .putString(KEY_HA_TOKEN, haToken)
                 .putString(KEY_HA_FILTER, haFilter)
+                .putString(KEY_ZEPP_APP_TOKEN, zeppToken)
+                .putString(KEY_CUSTOM_APP_NAMES, customAppNames)
                 .apply();
         makePrefsWorldReadable();
         broadcastConfigToNotify(true);
@@ -265,6 +280,8 @@ public class MainActivity extends Activity {
         intent.putExtra(KEY_HA_URL, prefs.getString(KEY_HA_URL, ""));
         intent.putExtra(KEY_HA_TOKEN, prefs.getString(KEY_HA_TOKEN, ""));
         intent.putExtra(KEY_HA_FILTER, prefs.getString(KEY_HA_FILTER, ""));
+        intent.putExtra(KEY_ZEPP_APP_TOKEN, prefs.getString(KEY_ZEPP_APP_TOKEN, ""));
+        intent.putExtra(KEY_CUSTOM_APP_NAMES, prefs.getString(KEY_CUSTOM_APP_NAMES, ""));
         intent.putExtra(KEY_AGPS_FORMAT, prefs.getInt(KEY_AGPS_FORMAT, 2));
         sendBroadcast(intent);
         if (showToast) {
@@ -617,7 +634,241 @@ public class MainActivity extends Activity {
         zpkCard.addView(btnPickCustomZpk);
 
         root.addView(zpkCard);
+
+        addSpacer(root, 18);
+
+        // Section Title: Notify App Store Name & Icon Fix
+        TextView secAppMeta = new TextView(this);
+        secAppMeta.setText("手錶小程式名稱與縮圖修復 (裝置 > 應用程式)");
+        secAppMeta.setTextColor(Color.parseColor("#CE93D8"));
+        secAppMeta.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        secAppMeta.setTypeface(Typeface.DEFAULT_BOLD);
+        secAppMeta.setPadding(dp(4), 0, 0, dp(8));
+        root.addView(secAppMeta);
+
+        LinearLayout appMetaCard = createCard("#18202C", "#2B3A4E");
+
+        TextView tvAppMetaInfo = new TextView(this);
+        tvAppMetaInfo.setText("• 透過本模組安裝的 .zpk（含內建 HA 電燈 1066510）會自動解析名稱與縮圖並轉換為 PNG，免填 Token。\n• 官方 Zepp 商店小程式需填入 Zepp apptoken 才能向官方商店抓取真實名稱與縮圖（抓取後自動本地快取）。");
+        tvAppMetaInfo.setTextColor(Color.parseColor("#B0BEC5"));
+        tvAppMetaInfo.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f);
+        tvAppMetaInfo.setPadding(0, 0, 0, dp(10));
+        appMetaCard.addView(tvAppMetaInfo);
+
+        TextView lblZeppToken = new TextView(this);
+        lblZeppToken.setText("Zepp 官方帳號 apptoken (選填)");
+        lblZeppToken.setTextColor(Color.parseColor("#CFD8DC"));
+        lblZeppToken.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f);
+        appMetaCard.addView(lblZeppToken);
+
+        etZeppToken = createStyledInput("可按下方「一鍵讀取 (Root)」或手動貼上 apptoken", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        appMetaCard.addView(etZeppToken);
+        addSpacer(appMetaCard, 10);
+
+        Button btnReadZeppToken = createStyledButton("🔑 一鍵從 Zepp App 讀取 apptoken (Root)", "#6A1B9A");
+        btnReadZeppToken.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                readZeppTokenViaRoot();
+            }
+        });
+        appMetaCard.addView(btnReadZeppToken);
+        addSpacer(appMetaCard, 8);
+
+        Button btnTestZeppToken = createStyledButton("🔍 測試 Token 並查詢官方小程式名稱", "#0277BD");
+        btnTestZeppToken.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                testZeppTokenAndLookup();
+            }
+        });
+        appMetaCard.addView(btnTestZeppToken);
+        addSpacer(appMetaCard, 10);
+
+        tvZeppTokenResult = new TextView(this);
+        tvZeppTokenResult.setTextColor(Color.parseColor("#B0BEC5"));
+        tvZeppTokenResult.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f);
+        tvZeppTokenResult.setPadding(0, 0, 0, dp(10));
+        tvZeppTokenResult.setVisibility(View.GONE);
+        appMetaCard.addView(tvZeppTokenResult);
+
+        TextView lblCustomNames = new TextView(this);
+        lblCustomNames.setText("自訂小程式名稱對照表 (選填，每行一筆 AppID=名稱)");
+        lblCustomNames.setTextColor(Color.parseColor("#CFD8DC"));
+        lblCustomNames.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f);
+        appMetaCard.addView(lblCustomNames);
+
+        etCustomAppNames = createStyledInput("例：\n1049670=我的小程式\n1052426=計時器", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
+        etCustomAppNames.setMinLines(3);
+        etCustomAppNames.setGravity(Gravity.TOP | Gravity.START);
+        appMetaCard.addView(etCustomAppNames);
+        addSpacer(appMetaCard, 10);
+
+        Button btnSaveAppMeta = createStyledButton("💾 儲存並同步小程式名稱設定至 Notify", "#2E7D32");
+        btnSaveAppMeta.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                saveAndSyncConfig();
+                if (tvZeppTokenResult != null) {
+                    tvZeppTokenResult.setVisibility(View.VISIBLE);
+                    tvZeppTokenResult.setText("✅ 已儲存並同步！重新進入 Notify「裝置 > 應用程式」即可看到名稱與縮圖。");
+                    tvZeppTokenResult.setTextColor(Color.parseColor("#81C784"));
+                }
+            }
+        });
+        appMetaCard.addView(btnSaveAppMeta);
+
+        root.addView(appMetaCard);
         setContentView(scroll);
+    }
+
+    private void readZeppTokenViaRoot() {
+        if (tvZeppTokenResult != null) {
+            tvZeppTokenResult.setVisibility(View.VISIBLE);
+            tvZeppTokenResult.setText("⏳ 正在透過 Root 解密讀取 Zepp App (hm_id_sdk_android MMKV) 的 apptoken...");
+            tvZeppTokenResult.setTextColor(Color.parseColor("#4FC3F7"));
+        }
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                String foundToken = null;
+                String errMsg = null;
+                try {
+                    // 1. Primary (Zepp v8/v9+): AES-128-CFB encrypted MMKV at files/mmkv/hm_id_sdk_android
+                    byte[] mmkvBin = readRootFileBytes("/data/data/com.huami.watch.hmwatchmanager/files/mmkv/hm_id_sdk_android");
+                    byte[] mmkvCrc = readRootFileBytes("/data/data/com.huami.watch.hmwatchmanager/files/mmkv/hm_id_sdk_android.crc");
+                    if (mmkvBin != null && mmkvBin.length > 8 && mmkvCrc != null && mmkvCrc.length >= 28) {
+                        int actualSize = (mmkvBin[0] & 0xFF)
+                                | ((mmkvBin[1] & 0xFF) << 8)
+                                | ((mmkvBin[2] & 0xFF) << 16)
+                                | ((mmkvBin[3] & 0xFF) << 24);
+                        if (actualSize > 0 && actualSize <= mmkvBin.length - 4) {
+                            byte[] key = "huami_kv_persist".getBytes(StandardCharsets.UTF_8);
+                            byte[] iv = java.util.Arrays.copyOfRange(mmkvCrc, 12, 28);
+                            javax.crypto.Cipher cipher = javax.crypto.Cipher.getInstance("AES/CFB/NoPadding");
+                            cipher.init(javax.crypto.Cipher.DECRYPT_MODE,
+                                    new javax.crypto.spec.SecretKeySpec(key, "AES"),
+                                    new javax.crypto.spec.IvParameterSpec(iv));
+                            byte[] plain = cipher.doFinal(mmkvBin, 4, actualSize);
+                            foundToken = extractAppTokenFromDump(new String(plain, StandardCharsets.UTF_8));
+                        }
+                    }
+
+                    // 2. Fallback (older Zepp): plaintext shared_prefs/hm_id_sdk_android.xml
+                    if (foundToken == null || foundToken.isEmpty()) {
+                        byte[] xmlBytes = readRootFileBytes("/data/data/com.huami.watch.hmwatchmanager/shared_prefs/hm_id_sdk_android.xml");
+                        if (xmlBytes != null && xmlBytes.length > 0) {
+                            foundToken = extractAppTokenFromDump(new String(xmlBytes, StandardCharsets.UTF_8));
+                        }
+                    }
+
+                    if (foundToken == null || foundToken.isEmpty()) {
+                        errMsg = "找不到 app_token（請確認手機有安裝並登入官方 Zepp App，且已授予本 App Root 權限；或使用電腦工具 huami-token 取得後手動貼上）。";
+                    }
+                } catch (Throwable t) {
+                    errMsg = "Root 讀取失敗：" + t.getMessage();
+                }
+                final String tok = foundToken;
+                final String err = errMsg;
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (tok != null && !tok.isEmpty()) {
+                            if (etZeppToken != null) etZeppToken.setText(tok);
+                            saveAndSyncConfig();
+                            if (tvZeppTokenResult != null) {
+                                String preview = tok.length() > 16 ? (tok.substring(0, 12) + "..." + tok.substring(tok.length() - 4)) : tok;
+                                tvZeppTokenResult.setText("✅ 成功讀取 Zepp apptoken (" + preview + ") 並已同步至 Notify！正在自動測試查詢...");
+                                tvZeppTokenResult.setTextColor(Color.parseColor("#81C784"));
+                            }
+                            testZeppTokenAndLookup();
+                        } else if (tvZeppTokenResult != null) {
+                            tvZeppTokenResult.setText("❌ " + err);
+                            tvZeppTokenResult.setTextColor(Color.parseColor("#FF8A80"));
+                        }
+                    }
+                });
+            }
+        }, "ZeppToken-Root").start();
+    }
+
+    private static byte[] readRootFileBytes(String path) {
+        try {
+            Process proc = Runtime.getRuntime().exec(new String[]{"su", "-c", "cat '" + path + "'"});
+            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+            try (InputStream is = proc.getInputStream()) {
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = is.read(buf)) > 0) {
+                    bos.write(buf, 0, n);
+                    if (bos.size() > 2 * 1024 * 1024) break;
+                }
+            }
+            proc.waitFor();
+            return bos.size() > 0 ? bos.toByteArray() : null;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static String extractAppTokenFromDump(String dump) {
+        if (dump == null || dump.isEmpty()) return null;
+        // Pattern 1: XML <string name="...app_token...">VALUE</string>
+        java.util.regex.Matcher m1 = java.util.regex.Pattern
+                .compile("(?i)app_?token[^>]*>([^<\\s]{16,})<")
+                .matcher(dump);
+        if (m1.find()) return m1.group(1).trim();
+        // Pattern 2: JSON "app_token":"VALUE" or &quot;app_token&quot;:&quot;VALUE&quot;
+        java.util.regex.Matcher m2 = java.util.regex.Pattern
+                .compile("(?i)(?:\"|&quot;)app_?token(?:\"|&quot;)\\s*:\\s*(?:\"|&quot;)([^\"&\\s]{16,})(?:\"|&quot;)")
+                .matcher(dump);
+        if (m2.find()) return m2.group(1).trim();
+        return null;
+    }
+
+    private void testZeppTokenAndLookup() {
+        final String token = etZeppToken != null ? etZeppToken.getText().toString().trim() : "";
+        if (token.isEmpty()) {
+            if (tvZeppTokenResult != null) {
+                tvZeppTokenResult.setVisibility(View.VISIBLE);
+                tvZeppTokenResult.setText("⚠️ 請先填入 Zepp apptoken 或按「一鍵讀取 (Root)」。");
+                tvZeppTokenResult.setTextColor(Color.parseColor("#FFB74D"));
+            }
+            return;
+        }
+        saveAndSyncConfig();
+        if (tvZeppTokenResult != null) {
+            tvZeppTokenResult.setVisibility(View.VISIBLE);
+            tvZeppTokenResult.setText("⏳ 正在向官方 Zepp 商店查詢小程式名稱與縮圖...");
+            tvZeppTokenResult.setTextColor(Color.parseColor("#4FC3F7"));
+        }
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                final java.util.List<Integer> sampleIds = java.util.Arrays.asList(
+                        1049670, 1052426, 1047865, 1109730, 1109731, 1001129, 1000025);
+                final java.util.Map<Integer, ZeppAppMetadataManager.AppMeta> map =
+                        ZeppAppMetadataManager.queryZeppStoreBatch(sampleIds, token);
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (tvZeppTokenResult == null) return;
+                        if (map.isEmpty()) {
+                            tvZeppTokenResult.setText("❌ 查詢無結果（可能 apptoken 已過期或區域不符）。重新登入 Zepp App 後再試一次即可。");
+                            tvZeppTokenResult.setTextColor(Color.parseColor("#FF8A80"));
+                        } else {
+                            StringBuilder sb = new StringBuilder("✅ 成功查到 " + map.size() + " 個官方小程式：\n");
+                            for (ZeppAppMetadataManager.AppMeta m : map.values()) {
+                                sb.append("• ").append(m.appId).append(" → ").append(m.name)
+                                        .append(m.iconUrl.isEmpty() ? "" : " [有縮圖]").append('\n');
+                            }
+                            tvZeppTokenResult.setText(sb.toString().trim());
+                            tvZeppTokenResult.setTextColor(Color.parseColor("#81C784"));
+                        }
+                    }
+                });
+            }
+        }, "ZeppToken-Test").start();
     }
 
     @Override
